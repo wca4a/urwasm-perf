@@ -1,0 +1,32 @@
+# other repositories and build products that live beside this one
+/vere/
+/vere-base/
+/vere-timers/
+/wasm3/
+/urbit/
+/urwasm/
+/holdem/
+/pier/
+/brass.pill
+/*.tar.gz
+/*.log
+/urbit-output
+# the poker game has its own repository (wca4a/urbit-holdem)
+/bench/poker/
+/bench/poker-app/
+/bench/poker.wasm
+/bench/mkpoker.mjs
+/bench/poker-seat.py
+# generated: build output, recorded runs, workloads the scripts recreate
+target/
+*.dSYM/
+/bench/crash/repro
+/bench/crash/repro-fixed
+/bench/*-out.*.txt
+/bench/*-log.*.txt
+/bench/*-times.*.json
+/bench/*-ref.json
+/bench/*-responses.*.txt
+/bench/*-work.txt
+/bench/test-out.*.txt
+.DS_Store

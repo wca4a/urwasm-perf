@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes on urwasm</title>
+<style>
+  :root { --bg:#f6f4ef; --card:#fffdf8; --ink:#1d1b16; --dim:#6f6a5e; --line:#ddd7c8; --accent:#b4541a; --ok:#2f6f3e; --code:#efeadd; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#171613; --card:#201e1a; --ink:#ece7da; --dim:#9a9484; --line:#37332b; --accent:#e58a4a; --ok:#7fc08c; --code:#2a2721; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding:16px 20px 10px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px 20px; align-items:baseline; }
+  h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--dim); font-size:13px; }
+  #meter { margin-left:auto; font:13px ui-monospace, Menlo, monospace; color:var(--dim); }
+  #meter b { color:var(--ok); }
+  main { display:grid; grid-template-columns:minmax(260px, 340px) 1fr; gap:16px; padding:16px 20px; max-width:1200px; }
+  @media (max-width: 760px) { main { grid-template-columns:1fr; padding:12px 16px; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .card + .card { margin-top:12px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px; }
+  input, textarea, button { font:inherit; color:inherit; }
+  input, textarea { width:100%; background:var(--bg); border:1px solid var(--line); border-radius:7px; padding:7px 9px; }
+  textarea { min-height:150px; resize:vertical; font:13px/1.45 ui-monospace, Menlo, monospace; }
+  input + textarea, textarea + input, input + input { margin-top:6px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:7px; padding:7px 12px; cursor:pointer; }
+  button.quiet { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+  ul.list { list-style:none; margin:0; padding:0; max-height:340px; overflow:auto; }
+  ul.list li { padding:7px 8px; border-radius:7px; cursor:pointer; }
+  ul.list li:hover, ul.list li.on { background:var(--code); }
+  ul.list .t { font-weight:600; }
+  ul.list .s { color:var(--dim); font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tag { display:inline-block; font-size:11.5px; background:var(--code); border-radius:99px; padding:1px 8px; margin-right:4px; color:var(--dim); }
+  #view h1, #view h2, #view h3 { text-transform:none; letter-spacing:0; color:var(--ink); margin:.8em 0 .3em; }
+  #view h1 { font-size:22px; } #view h2 { font-size:18px; } #view h3 { font-size:16px; }
+  #view pre, #view code { background:var(--code); border-radius:5px; font:13px ui-monospace, Menlo, monospace; }
+  #view pre { padding:10px; overflow:auto; } #view code { padding:1px 4px; } #view pre code { padding:0; }
+  #view table { border-collapse:collapse; } #view td, #view th { border:1px solid var(--line); padding:3px 9px; }
+  #view blockquote { border-left:3px solid var(--line); margin:.6em 0; padding-left:12px; color:var(--dim); }
+  #view { overflow-wrap:anywhere; }
+  .meta { color:var(--dim); font-size:12.5px; margin-bottom:6px; }
+  #log { font:12px/1.45 ui-monospace, Menlo, monospace; max-height:220px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }
+  #log .ms { color:var(--ok); } #log .rq { color:var(--accent); }
+  .empty { color:var(--dim); padding:20px 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Notes on urwasm</h1>
+  <span class="sub">A Rust program compiled to Wasm, running inside this Urbit ship</span>
+  <span id="meter">no requests yet</span>
+</header>
+<main>
+  <div>
+    <div class="card">
+      <h2>Search</h2>
+      <input id="q" placeholder="Type words, press Enter. Empty shows all notes.">
+      <ul class="list" id="list"><li class="empty">Loading</li></ul>
+    </div>
+    <div class="card">
+      <h2 id="formTitle">New note</h2>
+      <input id="title" placeholder="Title">
+      <textarea id="body" placeholder="Write Markdown here. Headings, lists, tables, code blocks all work."></textarea>
+      <input id="tags" placeholder="Tags, separated by commas">
+      <div class="row">
+        <button id="save">Add note</button>
+        <button class="quiet" id="cancel" hidden>Cancel edit</button>
+        <button class="quiet" id="sample">Add 20 sample notes</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Ship</h2>
+      <div id="stats" class="meta">Loading</div>
+      <div class="row"><button class="quiet" id="reset">Delete everything</button></div>
+    </div>
+  </div>
+  <div>
+    <div class="card">
+      <h2>Note</h2>
+      <div id="noteMeta" class="meta"></div>
+      <div id="view"><div class="empty">Pick a note on the left, or add one. The Markdown is turned into this page by the Rust program inside the ship.</div></div>
+      <div class="row" id="noteBtns" hidden>
+        <button class="quiet" id="edit">Edit</button>
+        <button class="quiet" id="del">Delete</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>What went over the wire</h2>
+      <pre id="log"></pre>
+    </div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let current = null, editing = null, count = 0, totalMs = 0;
+
+async function ask(req) {
+  const text = JSON.stringify(req), t = performance.now();
+  const r = await fetch('/notes/api', { method: 'POST', body: text });
+  const raw = await r.text(), ms = performance.now() - t;
+  count++; totalMs += ms;
+  $('meter').innerHTML = `last request <b>${ms.toFixed(1)} ms</b> round trip, ${count} so far, average ${(totalMs / count).toFixed(1)} ms`;
+  const line = document.createElement('div'), clip = s => s.length > 300 ? s.slice(0, 300) + ` ... (${s.length} bytes)` : s;
+  line.innerHTML = `<span class="rq"></span>\n<span class="ms"></span> <span class="rs"></span>\n`;
+  line.querySelector('.rq').textContent = '> ' + clip(text);
+  line.querySelector('.ms').textContent = `< ${ms.toFixed(1)} ms`;
+  line.querySelector('.rs').textContent = clip(raw);
+  $('log').prepend(line);
+  return JSON.parse(raw);
+}
+
+function item(id, title, sub) {
+  const li = document.createElement('li');
+  li.innerHTML = '<div class="t"></div><div class="s"></div>';
+  li.querySelector('.t').textContent = title; li.querySelector('.s').textContent = sub;
+  if (id === current) li.className = 'on';
+  li.onclick = () => open(id);
+  return li;
+}
+
+async function refresh() {
+  const q = $('q').value.trim(), list = $('list');
+  let rows;
+  if (q) {
+    const r = await ask({ op: 'search', q, limit: 50 });
+    rows = r.hits.map(h => [h.id, h.title, h.snippet]);
+  } else {
+    const r = await ask({ op: 'export' });
+    rows = r.notes.map(n => [n.id, n.title, n.body.replace(/\s+/g, ' ').slice(0, 90)]).reverse();
+  }
+  list.replaceChildren(...rows.map(r => item(...r)));
+  if (!rows.length) list.innerHTML = `<li class="empty">${q ? 'Nothing matches every word.' : 'No notes yet.'}</li>`;
+  const s = await ask({ op: 'stats' });
+  $('stats').textContent = `${s.notes} notes, ${s.bytes.toLocaleString()} bytes of text, ${s.distinct_words.toLocaleString()} distinct words indexed, ${s.served.toLocaleString()} requests served by the Wasm program`;
+}
+
+async function open(id) {
+  current = id;
+  const [g, r] = [await ask({ op: 'get', id }), await ask({ op: 'render', id })];
+  if (!g.ok) { current = null; return refresh(); }
+  $('noteMeta').innerHTML = '';
+  $('noteMeta').append(`#${g.note.id}, revision ${g.note.rev}, ${g.note.words} words, fingerprint ${g.note.digest} `);
+  for (const t of g.note.tags) { const s = document.createElement('span'); s.className = 'tag'; s.textContent = t; $('noteMeta').append(s); }
+  const h = document.createElement('h1'); h.textContent = g.note.title;
+  const frame = document.createElement('div'); frame.innerHTML = r.html;
+  frame.querySelectorAll('script,iframe,object,embed').forEach(e => e.remove());
+  $('view').replaceChildren(h, frame);
+  $('noteBtns').hidden = false; $('noteBtns').dataset.body = g.note.body; $('noteBtns').dataset.title = g.note.title;
+  document.querySelectorAll('#list li').forEach(li => li.classList.remove('on'));
+}
+
+function formMode(id) {
+  editing = id;
+  $('formTitle').textContent = id ? `Editing note #${id}` : 'New note';
+  $('save').textContent = id ? 'Save changes' : 'Add note';
+  $('cancel').hidden = !id; $('title').disabled = !!id; $('tags').disabled = !!id;
+  if (!id) { $('title').value = ''; $('body').value = ''; $('tags').value = ''; }
+}
+
+$('save').onclick = async () => {
+  const body = $('body').value;
+  if (editing) { const id = editing; await ask({ op: 'edit', id, body }); formMode(null); await refresh(); return open(id); }
+  const title = $('title').value.trim() || 'Untitled';
+  const tags = $('tags').value.split(',').map(s => s.trim()).filter(Boolean);
+  const r = await ask({ op: 'add', title, body, tags });
+  formMode(null); await refresh(); open(r.id);
+};
+$('cancel').onclick = () => formMode(null);
+$('edit').onclick = () => { formMode(current); $('title').value = $('noteBtns').dataset.title; $('body').value = $('noteBtns').dataset.body; $('body').focus(); };
+$('del').onclick = async () => {
+  await ask({ op: 'delete', id: current }); current = null; $('noteBtns').hidden = true; $('noteMeta').textContent = '';
+  $('view').innerHTML = '<div class="empty">Deleted.</div>'; refresh();
+};
+$('q').onkeydown = e => { if (e.key === 'Enter') refresh(); };
+$('reset').onclick = async () => {
+  if (!confirm('Delete every note on the ship?')) return;
+  await fetch('/notes/reset', { method: 'POST' }); current = null; $('noteBtns').hidden = true; $('noteMeta').textContent = '';
+  $('view').innerHTML = '<div class="empty">Everything deleted. The Wasm program starts fresh on the next request.</div>'; refresh();
+};
+
+const W = 'ship pier galaxy planet star moon kernel agent desk noun atom hoon nock jet wasm module memory page function garden orchard kitchen recipe bread butter coffee tea lemon winter summer river mountain budget invoice ledger meeting agenda'.split(' ');
+const pick = () => W[Math.floor(Math.random() * W.length)];
+const sent = n => { const s = Array.from({ length: n || 6 + Math.floor(Math.random() * 10) }, pick).join(' '); return s[0].toUpperCase() + s.slice(1) + '.'; };
+$('sample').onclick = async () => {
+  $('sample').disabled = true;
+  for (let i = 0; i < 20; i++) {
+    const body = [`## ${sent(3).slice(0, -1)}`, sent() + ' ' + sent(), `- ${sent(4)}\n- ${sent(4)}\n- **${pick()}** ${sent(3)}`,
+      '| thing | count |\n|---|---|\n' + `| ${pick()} | ${i + 1} |\n| ${pick()} | ${i * 3} |`, '```\n(add 2 ' + i + ')\n```', `> ${sent()}`].join('\n\n');
+    await ask({ op: 'add', title: sent(3).slice(0, -1), body, tags: [pick()] });
+  }
+  $('sample').disabled = false; refresh();
+};
+
+refresh();
+</script>
+</body>
+</html>

@@ -1,0 +1,568 @@
+From e8c78d99d23e3b496ae7518c24eb457119920c35 Mon Sep 17 00:00:00 2001
+From: william arzt <bill@tlon.io>
+Date: Wed, 25 Nov 2026 11:36:25 -0500
+Subject: [PATCH 2/3] urwasm: keep compiling lazily across suspension
+
+A computation suspended on an import holds positions in compiled code, so
+that code has to be laid out the same way when the state is loaded again.
+Until now that meant compiling the whole module up front for any module
+that had ever suspended, which gave up the lazy compile for every program
+that uses blocking imports.
+
+Record the order in which functions are compiled (new wasm3 hook) and save
+it with a suspended state. On load, compile those functions in that order,
+which rebuilds the same layout, then go on compiling lazily. The call that
+suspends is no longer run twice, except when its code outgrew the arena.
+
+Such states are cached under their own key, so a runtime without this
+change never sees one and recomputes from the seed instead.
+
+Requires the compile hook in urbit/wasm3.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ pkg/noun/jets/e/urwasm.c | 315 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 284 insertions(+), 31 deletions(-)
+
+diff --git a/pkg/noun/jets/e/urwasm.c b/pkg/noun/jets/e/urwasm.c
+index 1a0161f..a0f1820 100644
+--- a/pkg/noun/jets/e/urwasm.c
++++ b/pkg/noun/jets/e/urwasm.c
+@@ -106,6 +106,7 @@ typedef struct {
+   jmp_buf*  esc_u;  // escape buffer
+   c3_t      laz_t;  // lazy code arena: spill into extra chunks, never escape
+   c3_w      chk_w;  // number of extra chunks
++  c3_d      tot_d;  // bytes handed out, extra chunks included
+   void*     chk_u[UW_CHUNKS];  // extra chunks
+ } uw_arena;
+ 
+@@ -205,12 +206,32 @@ static_assert(
+   "u3we_run key tag must be a direct atom"
+ );
+ 
++//  memo tag for states suspended with lazily compiled code. these carry
++//  extra data and are kept apart from uw_run_m, so that a runtime that
++//  predates them never sees one: it misses and recomputes from the seed
++static const c3_m uw_ord_m = c3_s4('u','w','o','0');
++
+ //  memo tag for the per-context match data
+ static const c3_m uw_mat_m = c3_s4('u','w','m','0');
+ 
+-//  modules seen to suspend in this process: compile these eagerly.
+-//  a performance hint only, any value here is safe.
+-static c3_w _uw_eager_w[256];
++//  code arena size that the lazy calls of a module needed so far, by module
++//  mug. a performance hint only, any value here is safe.
++static struct { c3_w mug_w; c3_h siz_h; } _uw_code_u[256];
++
++#define UW_CODE_MIN  ((c3_h)1 << 20)
++#define UW_CODE_MAX  ((c3_h)1 << 30)
++
++//  smallest power of two that holds byt_d, within [UW_CODE_MIN UW_CODE_MAX]
++static c3_h
++_uw_code_size(c3_d byt_d)
++{
++  c3_h siz_h = UW_CODE_MIN;
++  while ( (siz_h < byt_d) && (siz_h < UW_CODE_MAX) )
++  {
++    siz_h <<= 1;
++  }
++  return siz_h;
++}
+ 
+ //  length without whole trailing zero pages (u3i_bytes strips the rest)
+ static c3_w
+@@ -270,6 +291,12 @@ typedef struct {
+   u3_noun queue;            // transferred
+   c3_t is_stateful;
+   c3_t laz_t;               // code is compiled on first call, not up front
++  c3_t rec_t;               // record the order functions are compiled in
++  c3_h* ord_h;              // that order, as function indices
++  c3_h orn_h;               // number of entries
++  c3_h orc_h;               // capacity
++  c3_t ork_t;               // the state was loaded from the uw_ord_m cache
++  c3_t cas_t;               // running inside +mice (u3a_flag_cash)
+ } lia_state;
+ 
+ typedef enum {
+@@ -296,6 +323,7 @@ _uw_arena_init_size(uw_arena* ren_u, c3_h siz_h)
+   ren_u->siz_h = siz_h;
+   ren_u->laz_t = 0;
+   ren_u->chk_w = 0;
++  ren_u->tot_d = 0;
+   u3i_slab_init(&ren_u->sab_u, 3, siz_h + 12);  // size + max padding
+   ren_u->buf_y = ren_u->nex_y = c3_align(ren_u->sab_u.buf_y, 16, C3_ALGHI);
+   ren_u->end_y = ren_u->buf_y + ren_u->siz_h;
+@@ -333,6 +361,7 @@ _uw_arena_grow(uw_arena* ren_u)
+   u3i_slab_init(&ren_u->sab_u, 3, new_h + 12);  // size + max padding
+   ren_u->buf_y = ren_u->nex_y = c3_align(ren_u->sab_u.buf_y, 16, C3_ALGHI);
+   ren_u->end_y = ren_u->nex_y + new_h;
++  ren_u->tot_d = 0;
+   c3_y pad_y = ren_u->nex_y - ren_u->sab_u.buf_y;
+   if (pad_y > 12)
+   {
+@@ -349,6 +378,7 @@ _uw_arena_reset(uw_arena* ren_u)
+     u3m_bail(c3__fail);
+   }
+   ren_u->nex_y = ren_u->buf_y;
++  ren_u->tot_d = 0;
+   memset(ren_u->buf_y, 0, (size_t)ren_u->siz_h);
+ }
+ 
+@@ -369,6 +399,49 @@ _uw_arena_free(uw_arena* ren_u)
+   ren_u->ini_t = 0;
+ }
+ 
++//  wasm3 calls this at the start of every function compilation.
++//  the layout of compiled code is a function of the order of compilation
++//  alone (nothing else allocates from the code arena), so a lazily compiled
++//  layout can be rebuilt later by compiling the same functions in the same
++//  order. only runtimes loaded by _get_state carry a lia_state here.
++//
++static void
++_uw_compile_hook(IM3Function fun_u, uint32_t idx_h)
++{
++  IM3Module   mod_u = fun_u->module;
++  lia_state*  sat_u = (mod_u && mod_u->runtime) ? mod_u->runtime->userdata
++                                                : NULL;
++  if ( !sat_u || !sat_u->rec_t )
++  {
++    return;
++  }
++  if ( sat_u->orn_h == sat_u->orc_h )
++  {
++    c3_h  new_h = sat_u->orc_h ? (sat_u->orc_h * 2) : 256;
++    c3_h* new_u = u3a_malloc((c3_z)new_h * sizeof(c3_h));
++    if ( sat_u->orn_h )
++    {
++      memcpy(new_u, sat_u->ord_h, (c3_z)sat_u->orn_h * sizeof(c3_h));
++      u3a_free(sat_u->ord_h);
++    }
++    sat_u->ord_h = new_u;
++    sat_u->orc_h = new_h;
++  }
++  sat_u->ord_h[sat_u->orn_h++] = idx_h;
++}
++
++static void
++_uw_order_free(lia_state* sat_u)
++{
++  if ( sat_u->orc_h )
++  {
++    u3a_free(sat_u->ord_h);
++  }
++  sat_u->ord_h = NULL;
++  sat_u->orn_h = sat_u->orc_h = 0;
++  sat_u->rec_t = 0;
++}
++
+ static void*
+ _calloc_code(size_t num_i, size_t len_i)
+ {
+@@ -401,8 +474,9 @@ _calloc_code(size_t num_i, size_t len_i)
+       _longjmp(*CodeArena->esc_u, c3__code);
+     }
+     //  lazy mode: this code is discarded before the state is saved, so it
+-    //  does not have to be contiguous. spill into a fresh chunk instead of
+-    //  moving the arena under running code.
++    //  does not have to be contiguous unless the call ends suspended (the
++    //  caller checks for that). spill into a fresh chunk instead of moving
++    //  the arena under running code.
+     //
+     if (CodeArena->chk_w >= UW_CHUNKS)
+     {
+@@ -424,6 +498,7 @@ _calloc_code(size_t num_i, size_t len_i)
+   *((c3_d*)lag_v + 1) = byt_d - 16;
+ 
+   CodeArena->nex_y = nex_y;
++  CodeArena->tot_d += byt_d + 16;
+   return ((c3_d*)lag_v + 2);
+ }
+ 
+@@ -1929,30 +2004,49 @@ _link_wasm_with_arrow_map(
+ //    ==
+ // seed RETAINED, produces the saved state (or u3_none, or ~ for a tombstone)
+ static u3_weak
+-_find_state(u3_noun seed)
++_find_tag(c3_m tag_m, u3_noun seed)
+ {
+-  //  u3_weak get = u3z_find_m(u3z_memo_keep, uw_run_m, seed);
+   //  XX order of search matters (sentinel value ~
+   //  from previous invocation is closer to the home road)
+   //  and u3z_find_m searches from home road down, which is the opposite
+   //  of what we want
+   //
+-  u3_noun key = u3z_key(uw_run_m, seed);
++  u3_noun key = u3z_key(tag_m, seed);
+   u3_weak get = u3z_find_up(key);
+   u3z(key);
+   return get;
+ }
+ 
++static u3_weak
++_find_state(u3_noun seed, c3_t* ork_t)
++{
++  u3_weak get = _find_tag(uw_ord_m, seed);
++  if ( (u3_none != get) && (u3_nul != get) )
++  {
++    *ork_t = 1;
++    return get;
++  }
++  *ork_t = 0;
++  return _find_tag(uw_run_m, seed);
++}
++
+ // hint, seed RETAINED; get (a result of _find_state) TRANSFERRED
+ // on success allocates sat_u->wasm_module->runtime->memory.mallocated
+-// and initializes the arenas
++// and initializes the arenas. siz_h is the size to give a lazy code arena,
++// or 0 for the default
+ static c3_t
+ _get_state(u3_noun hint,
+            u3_noun seed,
+            lia_state* sat_u,
+-           c3_t laz_t,
++           c3_h siz_h,
+            u3_weak get)
+ {
++  //  inside +mice the cache is handed to hoon as one map keyed by seed, so
++  //  states are kept there in the one form every runtime shares: no lazy
++  //  compilation, unless the state already depends on it
++  //
++  c3_t eag_t = sat_u->cas_t;
++
+   if (u3_none == get || u3_nul == get)
+   {
+     return 0;
+@@ -1993,7 +2087,27 @@ _get_state(u3_noun hint,
+       ? pad_box
+       : u3m_bail(c3__fail);
+     
+-    c3_h run_off_h = (u3a_direct_max_h > runtime_offset)
++    //  a computation that was suspended with lazily compiled code is saved
++    //  (under uw_ord_m) as [runtime-offset count order used]: the functions
++    //  that were compiled, in order, and the size of the code they made.
++    //
++    c3_t    ord_t = (c3y == u3du(runtime_offset));
++    u3_noun ord_num = 0, ord_dat = 0, ord_use = 0;
++    if ( ord_t )
++    {
++      u3_noun ord = u3t(runtime_offset);
++      runtime_offset = u3h(runtime_offset);
++      if (  (c3n == u3r_trel(ord, &ord_num, &ord_dat, &ord_use))
++         || (c3n == u3a_is_cat(ord_num))
++         || (c3n == u3ud(ord_dat))
++         || (c3n == u3a_is_cat(ord_use)) )
++      {
++        return u3m_bail(c3__fail);
++      }
++    }
++
++    c3_h run_off_h = ( (c3y == u3ud(runtime_offset))
++                     && (u3a_direct_max_h > runtime_offset) )
+       ? runtime_offset
+       : u3m_bail(c3__fail);
+     
+@@ -2010,15 +2124,30 @@ _get_state(u3_noun hint,
+     M3Result result;
+     IM3Runtime wasm3_runtime = (IM3Runtime)(BoxArena->buf_y + run_off_h);
+ 
+-    //  a suspended computation holds positions in compiled code, which are
+-    //  only reproducible if everything is compiled up front in a fixed order
++    //  a suspended computation holds positions in compiled code, so that
++    //  code has to be rebuilt exactly as it was: either everything in index
++    //  order (it was suspended after compiling everything up front), or the
++    //  recorded functions in the recorded order.
+     //
+-    laz_t = laz_t && (0 == wasm3_runtime->edge_suspend);
++    c3_t sus_t = (0 != wasm3_runtime->edge_suspend);
++    c3_t laz_t = (!sus_t && !eag_t) || ord_t;
++    if ( !sus_t && ord_t )
++    {
++      return u3m_bail(c3__fail);
++    }
+     sat_u->laz_t = laz_t;
++    sat_u->rec_t = 0;
++    sat_u->ord_h = NULL;
++    sat_u->orn_h = sat_u->orc_h = 0;
+     if (laz_t)
+     {
+-      _uw_arena_init_size(CodeArena, (c3_h)1 << 20);
+-      CodeArena->laz_t = 1;
++      //  the code to rebuild must fit without spilling: it is contiguous
++      //
++      //  (what runs after that may spill)
++      //
++      c3_h min_h = ord_t ? _uw_code_size((c3_d)ord_use + (1 << 16))
++                         : UW_CODE_MIN;
++      _uw_arena_init_size(CodeArena, c3_max(min_h, siz_h));
+     }
+     else
+     {
+@@ -2029,6 +2158,8 @@ _get_state(u3_noun hint,
+     m3_RewritePointersRuntime(wasm3_runtime, BoxArena->buf_y, 0 /*is_store*/);
+     IM3Module wasm3_module = wasm3_runtime->modules;
+     c3_h n_imports = wasm3_module->numFuncImports;
++    wasm3_runtime->userdata = sat_u;  //  for _uw_compile_hook
++    sat_u->rec_t = laz_t;
+ 
+     // make sure to not touch BoxArena
+     m3_SetAllocators(_calloc_bail, _free_bail, _realloc_bail);
+@@ -2064,7 +2195,28 @@ _get_state(u3_noun hint,
+           }
+         }
+ 
+-        result = laz_t ? m3Err_none : m3_CompileModule(wasm3_module);
++        if ( !laz_t )
++        {
++          result = m3_CompileModule(wasm3_module);
++        }
++        else
++        {
++          //  rebuild the code of a suspended computation
++          //
++          c3_h ord_h;
++          result = m3Err_none;
++          for (c3_h i = 0; !result && (i < (c3_h)ord_num); i++)
++          {
++            ord_h = 0;
++            u3r_bytes(4 * i, 4, (c3_y*)&ord_h, ord_dat);
++            if (  (ord_h >= wasm3_module->numFunctions)
++               || wasm3_module->functions[ord_h].compiled )
++            {
++              return u3m_bail(c3__fail);
++            }
++            result = CompileFunction(&wasm3_module->functions[ord_h]);
++          }
++        }
+         if (result)
+         {
+           fprintf(stderr, ERR("compilation error: %s"), result);
+@@ -2075,7 +2227,23 @@ _get_state(u3_noun hint,
+       }
+       else
+       {
+-        if (jmp_i == c3__code)
++        if ( (jmp_i == c3__code) && laz_t )
++        {
++          //  the lazy arena is too small even to set up (import stubs, the
++          //  code of a suspended computation). start over from the saved
++          //  state with twice the room
++          //
++          c3_h big_h = CodeArena->siz_h;
++          if ( big_h >= UW_CODE_MAX )
++          {
++            return u3m_bail(c3__fail);
++          }
++          _uw_order_free(sat_u);
++          _uw_arena_free(CodeArena);
++          _uw_arena_free(BoxArena);
++          return _get_state(hint, seed, sat_u, big_h * 2, get);
++        }
++        else if (jmp_i == c3__code)
+         {
+           _uw_arena_grow(CodeArena);
+         }
+@@ -2087,6 +2255,29 @@ _get_state(u3_noun hint,
+       }
+     }
+ 
++    if ( laz_t )
++    {
++      if (  ord_t
++         && (  ((c3_h)ord_num != sat_u->orn_h)
++            || ((c3_d)ord_use != (c3_d)(CodeArena->nex_y - CodeArena->buf_y)) ) )
++      {
++        //  the rebuilt code is not laid out like the code the computation
++        //  was suspended in: its saved positions cannot be trusted.
++        //  drop this state, the caller recomputes it from the seed
++        //
++        fprintf(stderr, WUT("suspended code layout mismatch, recomputing"));
++        _uw_order_free(sat_u);
++        sat_u->laz_t = 0;
++        _uw_arena_free(CodeArena);
++        _uw_arena_free(BoxArena);
++        u3z(get);
++        return 0;
++      }
++      //  from here on code is compiled while wasm runs: never move it
++      //
++      CodeArena->laz_t = 1;
++    }
++
+     {
+       sat_u->yil_previous = u3k(yil_previous);
+       sat_u->queue = u3k(queue);
+@@ -2240,15 +2431,30 @@ _move_state(
+   u3_noun hint,
+   u3_noun yil)
+ {
++  //  suspended with lazily compiled code that outgrew the arena and is in
++  //  pieces (the caller could not make it fit): it cannot be rebuilt, so it
++  //  is not kept. the next call recomputes from the seed. nor is one kept
++  //  inside +mice, where the uw_ord_m cache is not used (see _get_state)
++  //
++  c3_t los_t =  sat_u->laz_t
++             && (CodeArena->chk_w || sat_u->cas_t)
++             && sat_u->wasm_module->runtime->edge_suspend;
++
+   if ( (c3__oust == hint)
+       || (2 == u3h(yil))
+       || (c3__rand == hint && 0 == u3h(yil))
++      || los_t
+   )
+   {
+     u3z(u3z_save_m(u3z_memo_keep, uw_run_m, seed_old, u3_nul));
++    if ( sat_u->ork_t && !sat_u->cas_t )
++    {
++      u3z(u3z_save_m(u3z_memo_keep, uw_ord_m, seed_old, u3_nul));
++    }
+     IM3Runtime run_u = sat_u->wasm_module->runtime;
+     M3MemoryHeader* mem_u = run_u->memory.mallocated;
+     u3a_free(mem_u);
++    _uw_order_free(sat_u);
+     _uw_arena_free(CodeArena);
+     _uw_arena_free(BoxArena);
+     return;
+@@ -2273,6 +2479,22 @@ _move_state(
+ 
+   u3a_free(mem_u);
+ 
++  //  suspended with lazily compiled code: save what it takes to rebuild it
++  //
++  u3_noun ord = u3_none;
++  if ( sat_u->laz_t && run_u->edge_suspend )
++  {
++    c3_d use_d = (c3_d)(CodeArena->nex_y - CodeArena->buf_y);
++    if ( u3a_direct_max_h < use_d )
++    {
++      u3m_bail(c3__fail);
++    }
++    ord = u3nt(sat_u->orn_h,
++               u3i_bytes((c3_w)sat_u->orn_h * 4, (c3_y*)sat_u->ord_h),
++               (c3_h)use_d);
++  }
++  _uw_order_free(sat_u);
++
+   m3_RewritePointersRuntime(run_u, BoxArena->buf_y, 1 /*is_store*/);
+   c3_h run_off_h = (c3_y*)run_u - BoxArena->buf_y;
+   if (u3a_direct_max_h < run_off_h)
+@@ -2305,7 +2527,7 @@ _move_state(
+     sat_u->queue,
+     u3nc(u3nc(box_len_h, q_box), pad_y),
+     u3nc(u3nc(len_buf_w, q_buf), stk_off_h),
+-    run_off_h,
++    (u3_none == ord) ? run_off_h : u3nc(run_off_h, ord),
+     sat_u->lia_shop,
+     u3k(sat_u->acc), // accumulator will be returned
+     sat_u->susp_list
+@@ -2315,8 +2537,14 @@ _move_state(
+   sat_u->queue = u3_none;
+ 
+   u3z(u3z_save_m(u3z_memo_keep, uw_run_m, seed_old, u3_nul));
++  if ( sat_u->ork_t && !sat_u->cas_t )
++  {
++    u3z(u3z_save_m(u3z_memo_keep, uw_ord_m, seed_old, u3_nul));
++  }
+ 
+-  u3z(u3z_save_m(u3z_memo_keep, uw_run_m, seed_new, stash));
++  u3z(u3z_save_m(u3z_memo_keep,
++                 (u3_none == ord) ? uw_run_m : uw_ord_m,
++                 seed_new, stash));
+ }
+ 
+ u3_weak
+@@ -2528,6 +2756,11 @@ u3we_lia_run_v1(u3_noun cor)
+ 
+ 
+   lia_state sat;
++  sat.rec_t = 0;
++  sat.ord_h = NULL;
++  sat.orn_h = sat.orc_h = 0;
++  sat.ork_t = 0;
++  sat.cas_t = !!(u3R->how.fag_w & u3a_flag_cash);
+ 
+   BoxArena = &sat.box_arena;
+   CodeArena = &sat.code_arena;
+@@ -2537,14 +2770,17 @@ u3we_lia_run_v1(u3_noun cor)
+   {
+     sat.is_stateful = 1;
+     sat.laz_t = 0;
++    m3_SetCompileHook(_uw_compile_hook);
+     c3_w mug_w = u3r_mug(u3at(seed_module, seed));
++    c3_h siz_h = (_uw_code_u[mug_w & 255].mug_w == mug_w)
++               ? _uw_code_u[mug_w & 255].siz_h
++               : 0;
+     //  keep our own reference to the saved state: a nested run:wasm on the
+     //  same seed (from an import) may replace it in the cache with a
+-    //  tombstone, and the eager redo below must load the same state again
++    //  tombstone, and the redo below must load the same state again
+     //
+-    u3_weak sav = _find_state(seed);
+-    c3_t    hit_t = _get_state(hint, seed, &sat,
+-                               (_uw_eager_w[mug_w & 255] != mug_w),
++    u3_weak sav = _find_state(seed, &sat.ork_t);
++    c3_t    hit_t = _get_state(hint, seed, &sat, siz_h,
+                                (u3_none == sav) ? u3_none : u3k(sav));
+     if ( hit_t )
+     {
+@@ -2553,14 +2789,29 @@ u3we_lia_run_v1(u3_noun cor)
+       sat.resolution = u3_none;
+       yil = _apply_diff(input_tag, p_input, &sat);
+ 
+-      if ( sat.laz_t && sat.wasm_module->runtime->edge_suspend )
++      if ( sat.laz_t )
+       {
+-        //  the call ended suspended after lazy compilation: the saved
+-        //  positions in code would not be reproducible on the next load.
+-        //  discard this attempt and redo it with eager compilation, and
+-        //  remember that this module suspends.
++        //  remember how much room this module's code took. let the size
++        //  come back down after lighter calls: a call that needs more just
++        //  spills, which only costs a redo if it also ends suspended
++        //
++        c3_h old_h = (_uw_code_u[mug_w & 255].mug_w == mug_w)
++                   ? _uw_code_u[mug_w & 255].siz_h
++                   : UW_CODE_MIN;
++        siz_h = _uw_code_size(CodeArena->tot_d + (CodeArena->tot_d >> 2));
++        _uw_code_u[mug_w & 255].mug_w = mug_w;
++        _uw_code_u[mug_w & 255].siz_h = c3_max(siz_h, old_h / 2);
++      }
++
++      if (  sat.laz_t && !oust_t
++         && CodeArena->chk_w
++         && (siz_h > CodeArena->siz_h)
++         && sat.wasm_module->runtime->edge_suspend )
++      {
++        //  the call ended suspended, and its code outgrew the arena and is
++        //  in pieces: positions in it could not be rebuilt on the next
++        //  load. discard this attempt and redo it in an arena that fits.
+         //
+-        _uw_eager_w[mug_w & 255] = mug_w;
+         u3z(yil);
+         u3z(sat.lia_shop);
+         u3z(sat.susp_list);
+@@ -2568,10 +2819,11 @@ u3we_lia_run_v1(u3_noun cor)
+         u3z(sat.queue);
+         u3z(sat.acc);
+         u3a_free(sat.wasm_module->runtime->memory.mallocated);
++        _uw_order_free(&sat);
+         _uw_arena_free(CodeArena);
+         _uw_arena_free(BoxArena);
+ 
+-        if ( !_get_state(hint, seed, &sat, 0, u3k(sav)) )
++        if ( !_get_state(hint, seed, &sat, siz_h, u3k(sav)) )
+         {
+           return u3m_bail(c3__fail);
+         }
+@@ -2583,6 +2835,7 @@ u3we_lia_run_v1(u3_noun cor)
+     }
+     else
+     { // instantiate state with retries
++      sat.laz_t = 0;
+       u3_noun octs = u3at(seed_module, seed_new);
+       u3_noun p_octs, q_octs;
+       u3x_cell(octs, &p_octs, &q_octs);
+-- 
+2.52.0
+

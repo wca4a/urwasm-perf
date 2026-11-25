@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL on urwasm</title>
+<style>
+  :root { --bg:#f6f4ef; --card:#fffdf8; --ink:#1d1b16; --dim:#6f6a5e; --line:#ddd7c8; --accent:#b4541a; --ok:#2f6f3e; --bad:#a3271d; --code:#efeadd; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#171613; --card:#201e1a; --ink:#ece7da; --dim:#9a9484; --line:#37332b; --accent:#e58a4a; --ok:#7fc08c; --bad:#f08a7e; --code:#2a2721; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding:16px 20px 10px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px 20px; align-items:baseline; }
+  h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--dim); font-size:13px; }
+  #meter { margin-left:auto; font:13px ui-monospace, Menlo, monospace; color:var(--dim); }
+  #meter b { color:var(--ok); }
+  main { display:grid; grid-template-columns:minmax(230px, 290px) minmax(0, 1fr); gap:16px; padding:16px 20px; }
+  @media (max-width: 760px) { main { grid-template-columns:minmax(0, 1fr); padding:12px 16px; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .card + .card { margin-top:12px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px; }
+  textarea, button { font:inherit; color:inherit; }
+  textarea { width:100%; min-height:150px; resize:vertical; background:var(--bg); border:1px solid var(--line); border-radius:7px; padding:9px 11px; font:13.5px/1.5 ui-monospace, Menlo, monospace; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:7px; padding:7px 12px; cursor:pointer; }
+  button.quiet { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; align-items:center; }
+  .hint { color:var(--dim); font-size:12.5px; }
+  ul.plain { list-style:none; margin:0; padding:0; }
+  ul.plain li { padding:5px 8px; border-radius:7px; cursor:pointer; }
+  ul.plain li:hover { background:var(--code); }
+  .tname { font-weight:600; } .tcols { color:var(--dim); font-size:12px; overflow-wrap:anywhere; }
+  .tcount { float:right; color:var(--dim); font-size:12px; }
+  .result + .result { margin-top:14px; }
+  .scroll { overflow:auto; max-height:420px; border:1px solid var(--line); border-radius:7px; }
+  table { border-collapse:collapse; font:13px ui-monospace, Menlo, monospace; width:100%; }
+  th, td { text-align:left; padding:4px 10px; border-bottom:1px solid var(--line); white-space:nowrap; max-width:420px; overflow:hidden; text-overflow:ellipsis; }
+  th { position:sticky; top:0; background:var(--code); }
+  td.num { text-align:right; } td.null { color:var(--dim); font-style:italic; }
+  .note { color:var(--dim); font-size:12.5px; margin-top:4px; }
+  .error { color:var(--bad); font:13.5px ui-monospace, Menlo, monospace; padding:8px 10px; border:1px solid var(--bad); border-radius:7px; margin-top:10px; overflow-wrap:anywhere; }
+  .empty { color:var(--dim); padding:14px 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SQL on urwasm</h1>
+  <span class="sub">The real SQLite database engine, compiled to Wasm, running inside this Urbit ship</span>
+  <span id="meter">no requests yet</span>
+</header>
+<main>
+  <div>
+    <div class="card">
+      <h2>Tables</h2>
+      <ul class="plain" id="tables"><li class="empty">Loading</li></ul>
+      <div class="row">
+        <button class="quiet" id="sample">Load sample shop</button>
+        <button class="quiet" id="reset">Delete database</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Things to try</h2>
+      <ul class="plain" id="examples"></ul>
+    </div>
+  </div>
+  <div>
+    <div class="card">
+      <h2>Query</h2>
+      <textarea id="sql" spellcheck="false">SELECT sqlite_version() AS sqlite, datetime('now') AS ship_time, abs(random()) % 6 + 1 AS dice;</textarea>
+      <div class="row">
+        <button id="run">Run</button>
+        <span class="hint">Cmd+Enter or Ctrl+Enter also runs it. Several statements separated by semicolons are fine.</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Result</h2>
+      <div id="out"><div class="empty">Nothing run yet.</div></div>
+    </div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let count = 0, totalMs = 0;
+
+async function ask(sql) {
+  const t = performance.now();
+  const r = await fetch('/sql/api', { method: 'POST', body: sql });
+  const raw = await r.text(), ms = performance.now() - t;
+  count++; totalMs += ms;
+  $('meter').innerHTML = `last request <b>${ms.toFixed(1)} ms</b> round trip, ${count} so far, average ${(totalMs / count).toFixed(1)} ms`;
+  const res = JSON.parse(raw); res.ms = ms; res.bytes = raw.length;
+  return res;
+}
+
+function show(res) {
+  const out = $('out'); out.replaceChildren();
+  res.results.forEach((r, i) => {
+    const box = document.createElement('div'); box.className = 'result';
+    if (r.columns.length) {
+      const wrap = document.createElement('div'); wrap.className = 'scroll';
+      const table = document.createElement('table'), head = table.insertRow();
+      for (const c of r.columns) { const th = document.createElement('th'); th.textContent = c; head.append(th); }
+      for (const row of r.rows) {
+        const tr = table.insertRow();
+        for (const v of row) {
+          const td = tr.insertCell();
+          if (v === null) { td.textContent = 'null'; td.className = 'null'; }
+          else { td.textContent = v; td.title = v; if (typeof v === 'number') td.className = 'num'; }
+        }
+      }
+      wrap.append(table); box.append(wrap);
+    }
+    const note = document.createElement('div'); note.className = 'note';
+    note.textContent = r.columns.length
+      ? (r.count > r.rows.length ? `Showing the first ${r.rows.length} of ${r.count} rows.` : `${r.count} ${r.count === 1 ? 'row' : 'rows'}.`)
+      : `Statement ${i + 1} done${r.changes ? `, ${r.changes} ${r.changes === 1 ? 'row' : 'rows'} changed` : ''}.`;
+    box.append(note); out.append(box);
+  });
+  if (res.error) { const e = document.createElement('div'); e.className = 'error'; e.textContent = res.error; out.append(e); }
+  if (!res.results.length && !res.error) out.innerHTML = '<div class="empty">Nothing to run.</div>';
+  const foot = document.createElement('div'); foot.className = 'note';
+  foot.textContent = `${res.ms.toFixed(1)} ms round trip, ${res.bytes.toLocaleString()} bytes back from the ship.`;
+  out.append(foot);
+}
+
+async function run() {
+  $('run').disabled = true;
+  try { show(await ask($('sql').value)); await tables(); }
+  catch (e) { $('out').innerHTML = ''; const d = document.createElement('div'); d.className = 'error'; d.textContent = 'The ship did not answer: ' + e; $('out').append(d); }
+  $('run').disabled = false;
+}
+
+async function tables() {
+  const r = await ask("SELECT m.name, m.type, (SELECT group_concat(p.name, ', ') FROM pragma_table_info(m.name) p) AS cols FROM sqlite_master m WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '%\\_data' ESCAPE '\\' AND m.name NOT LIKE '%\\_idx' ESCAPE '\\' AND m.name NOT LIKE '%\\_content' ESCAPE '\\' AND m.name NOT LIKE '%\\_docsize' ESCAPE '\\' AND m.name NOT LIKE '%\\_config' ESCAPE '\\' ORDER BY m.name");
+  const list = $('tables'); list.replaceChildren();
+  const rows = r.results[0] ? r.results[0].rows : [];
+  for (const [name, type, cols] of rows) {
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="tcount"></span><div class="tname"></div><div class="tcols"></div>';
+    li.querySelector('.tname').textContent = name; li.querySelector('.tcols').textContent = cols || '';
+    li.querySelector('.tcount').textContent = type === 'view' ? 'view' : '';
+    li.onclick = () => { $('sql').value = `SELECT * FROM "${name}" LIMIT 100;`; run(); };
+    list.append(li);
+  }
+  if (!rows.length) list.innerHTML = '<li class="empty">No tables yet. Load the sample shop, or create your own.</li>';
+}
+
+const examples = [
+  ['Ask the ship for the time and a dice roll', "SELECT datetime('now') AS ship_time, date('now', '+30 days') AS in_30_days, abs(random()) % 6 + 1 AS dice, hex(randomblob(8)) AS random_bytes;"],
+  ['Make a table and fill it', "CREATE TABLE IF NOT EXISTS todo(id INTEGER PRIMARY KEY, task TEXT NOT NULL, done INTEGER DEFAULT 0, added TEXT DEFAULT (datetime('now')));\nINSERT INTO todo(task) VALUES ('boot a ship'), ('compile SQLite to Wasm'), ('run it in urwasm');\nUPDATE todo SET done = 1 WHERE id < 3;\nSELECT * FROM todo;"],
+  ['Best customers by city (join, ranking)', "SELECT c.city, c.name, round(sum(i.qty * p.price_cents) / 100.0, 2) AS spent,\n       rank() OVER (PARTITION BY c.city ORDER BY sum(i.qty * p.price_cents) DESC) AS place\nFROM customers c\nJOIN orders o ON o.customer_id = c.id\nJOIN order_items i ON i.order_id = o.id\nJOIN products p ON p.id = i.product_id\nGROUP BY c.id\nORDER BY c.city, place\nLIMIT 40;"],
+  ['Sales by month with running total', "WITH monthly AS (\n  SELECT substr(o.placed, 1, 7) AS month, sum(i.qty * p.price_cents) / 100.0 AS sales\n  FROM orders o JOIN order_items i ON i.order_id = o.id JOIN products p ON p.id = i.product_id\n  GROUP BY 1)\nSELECT month, round(sales, 2) AS sales, round(sum(sales) OVER (ORDER BY month), 2) AS running_total FROM monthly;"],
+  ['Full-text search over products', "SELECT name, snippet(product_search, 1, '[', ']', '...', 8) AS hit\nFROM product_search WHERE product_search MATCH 'oak OR steel'\nORDER BY rank LIMIT 15;"],
+  ['Read JSON stored in a column', "SELECT name, json_extract(profile, '$.age') AS age, json_extract(profile, '$.likes[0]') AS likes\nFROM customers WHERE json_extract(profile, '$.vip') ORDER BY age DESC LIMIT 20;"],
+  ['Count to a hundred Fibonacci numbers', "WITH RECURSIVE fib(n, a, b) AS (SELECT 1, 0, 1 UNION ALL SELECT n + 1, b, a + b FROM fib WHERE n < 90)\nSELECT n, a AS fibonacci FROM fib;"],
+  ['How SQLite plans a query', "EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 7 AND placed > '2026-06-01';"],
+  ['Make a mistake on purpose', "SELECT * FROM table_that_is_not_there;"],
+  ['Check the database is healthy', "PRAGMA integrity_check;\nSELECT count(*) AS tables FROM sqlite_master WHERE type = 'table';"],
+];
+for (const [label, sql] of examples) {
+  const li = document.createElement('li'); li.textContent = label;
+  li.onclick = () => { $('sql').value = sql; run(); };
+  $('examples').append(li);
+}
+
+const pick = a => a[Math.floor(Math.random() * a.length)], rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const q = s => "'" + s.replace(/'/g, "''") + "'", two = n => String(n).padStart(2, '0');
+const FIRST = 'Ada Grace Alan Linus Barbara Ken Dennis Margaret Edsger Donald Radia Tim Hedy Claude John Frances'.split(' ');
+const LAST = 'Lovelace Hopper Turing Torvalds Liskov Thompson Ritchie Hamilton Dijkstra Knuth Perlman Lee Lamarr Shannon Backus Allen'.split(' ');
+const CITY = 'Lisbon Austin Kyoto Oslo Nairobi Lima Tallinn Denver'.split(' ');
+const THING = 'kettle lamp notebook keyboard chair desk backpack bottle headphones monitor cable charger mug plant stool shelf'.split(' ');
+const ADJ = 'red small oak steel quiet bright folding heavy tiny smart'.split(' ');
+$('sample').onclick = async () => {
+  $('sample').disabled = true; $('sample').textContent = 'Loading';
+  const NC = 200, NP = 80, NO = 1000;
+  let r = await ask(`DROP VIEW IF EXISTS order_totals; DROP TABLE IF EXISTS order_items; DROP TABLE IF EXISTS orders; DROP TABLE IF EXISTS customers; DROP TABLE IF EXISTS products; DROP TABLE IF EXISTS product_search;
+    CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE, city TEXT, joined TEXT, profile TEXT);
+    CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT NOT NULL, price_cents INTEGER NOT NULL CHECK(price_cents > 0), stock INTEGER NOT NULL DEFAULT 0, description TEXT);
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id), placed TEXT NOT NULL, status TEXT NOT NULL);
+    CREATE TABLE order_items(order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id), qty INTEGER NOT NULL, PRIMARY KEY(order_id, product_id)) WITHOUT ROWID;
+    CREATE INDEX orders_by_customer ON orders(customer_id);
+    CREATE VIRTUAL TABLE product_search USING fts5(name, description);`);
+  const c = [], p = [];
+  for (let i = 1; i <= NC; i++) { const f = pick(FIRST), l = pick(LAST);
+    c.push(`(${i},${q(f + ' ' + l)},${q((f + '.' + l + i + '@example.com').toLowerCase())},${q(pick(CITY))},${q(`20${rnd(18, 26)}-${two(rnd(1, 12))}-${two(rnd(1, 28))}`)},${q(JSON.stringify({ vip: Math.random() < .3, age: rnd(18, 80), likes: [pick(THING), pick(THING)] }))})`); }
+  for (let i = 1; i <= NP; i++) p.push(`(${i},${q(pick(ADJ) + ' ' + pick(THING))},${rnd(199, 49999)},${rnd(0, 300)},${q(Array.from({ length: rnd(8, 24) }, () => pick(ADJ.concat(THING))).join(' '))})`);
+  if (!r.error) r = await ask(`BEGIN; INSERT INTO customers VALUES ${c.join(',')}; INSERT INTO products VALUES ${p.join(',')}; INSERT INTO product_search(rowid, name, description) SELECT id, name, description FROM products; COMMIT;`);
+  for (let b = 0; b < NO && !r.error; b += 250) {
+    const o = [], it = [];
+    for (let i = b + 1; i <= b + 250; i++) {
+      o.push(`(${i},${rnd(1, NC)},${q(`2026-${two(rnd(1, 11))}-${two(rnd(1, 28))}`)},${q(pick(['paid', 'paid', 'paid', 'shipped', 'refunded', 'open']))})`);
+      const seen = new Set(); for (let k = rnd(1, 4); k > 0; k--) { const pid = rnd(1, NP); if (!seen.has(pid)) { seen.add(pid); it.push(`(${i},${pid},${rnd(1, 4)})`); } }
+    }
+    r = await ask(`BEGIN; INSERT INTO orders VALUES ${o.join(',')}; INSERT INTO order_items VALUES ${it.join(',')}; COMMIT;`);
+  }
+  $('sample').disabled = false; $('sample').textContent = 'Load sample shop';
+  if (r.error) { show(r); return tables(); }
+  $('sql').value = "SELECT (SELECT count(*) FROM customers) AS customers, (SELECT count(*) FROM products) AS products,\n       (SELECT count(*) FROM orders) AS orders, (SELECT count(*) FROM order_items) AS order_items;";
+  run();
+};
+$('reset').onclick = async () => {
+  if (!confirm('Delete the whole database on the ship?')) return;
+  await fetch('/sql/reset', { method: 'POST' });
+  $('out').innerHTML = '<div class="empty">Database deleted. SQLite starts fresh on the next request.</div>'; tables();
+};
+$('run').onclick = run;
+$('sql').onkeydown = e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); run(); } };
+tables();
+</script>
+</body>
+</html>

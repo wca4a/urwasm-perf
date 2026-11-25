@@ -1,0 +1,74 @@
+From 4943a9fdde177dec04695a9390fc6faa9643acc6 Mon Sep 17 00:00:00 2001
+From: william arzt <bill@tlon.io>
+Date: Wed, 25 Nov 2026 11:51:41 -0500
+Subject: [PATCH 3/3] urwasm: pack the match data field by field
+
+The cached match data was packed and unpacked by indexing a pointer to the
+first field of the struct across its other fields, which C does not define.
+List the fields instead.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ pkg/noun/jets/e/urwasm.c | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/pkg/noun/jets/e/urwasm.c b/pkg/noun/jets/e/urwasm.c
+index a0f1820..4682a49 100644
+--- a/pkg/noun/jets/e/urwasm.c
++++ b/pkg/noun/jets/e/urwasm.c
+@@ -274,7 +274,23 @@ typedef struct {
+   u3_noun set_all_glob_ctx;
+ } match_data_struct;
+ 
+-#define UW_MATCH_LEN  (sizeof(match_data_struct) / sizeof(u3_noun))
++#define UW_MATCH_LEN  25
++
++static_assert(
++  (UW_MATCH_LEN * sizeof(u3_noun) == sizeof(match_data_struct)),
++  "UW_MATCH_FIELDS must list every field of match_data_struct"
++);
++
++//  the fields of a match_data_struct in order, for packing and unpacking
++#define UW_MATCH_FIELDS(m)                                                   \
++  { &(m)->call_bat, &(m)->memread_bat, &(m)->memwrite_bat,                   \
++    &(m)->call_ext_bat, &(m)->try_bat, &(m)->catch_bat, &(m)->return_bat,    \
++    &(m)->fail_bat, &(m)->global_set_bat, &(m)->global_get_bat,              \
++    &(m)->mem_grow_bat, &(m)->mem_size_bat, &(m)->get_acc_bat,               \
++    &(m)->set_acc_bat, &(m)->get_all_glob_bat, &(m)->set_all_glob_bat,       \
++    &(m)->call_ctx, &(m)->memread_ctx, &(m)->memwrite_ctx,                   \
++    &(m)->global_set_ctx, &(m)->global_get_ctx, &(m)->mem_grow_ctx,          \
++    &(m)->mem_size_ctx, &(m)->get_all_glob_ctx, &(m)->set_all_glob_ctx }
+ 
+ typedef struct {
+   IM3Module wasm_module;    // p
+@@ -2597,11 +2613,11 @@ u3we_lia_run_v1(u3_noun cor)
+   u3_weak mat_get = mem_t ? u3z_find_m(u3z_memo_keep, uw_mat_m, ctx) : u3_none;
+   if ( u3_none != mat_get )
+   {
+-    u3_noun* mat_u = (u3_noun*)&match;
++    u3_noun* mat_u[UW_MATCH_LEN] = UW_MATCH_FIELDS(&match);
+     u3_noun  lit = mat_get;
+     for (c3_w i = 0; i < UW_MATCH_LEN; i++)
+     {
+-      mat_u[i] = u3k(u3h(lit));
++      *mat_u[i] = u3k(u3h(lit));
+       lit = u3t(lit);
+     }
+     try_gate_inner = u3k(lit);
+@@ -2708,11 +2724,11 @@ u3we_lia_run_v1(u3_noun cor)
+ 
+     if ( mem_t )
+     {
+-      u3_noun* mat_u = (u3_noun*)&match;
++      u3_noun* mat_u[UW_MATCH_LEN] = UW_MATCH_FIELDS(&match);
+       u3_noun  val = u3k(try_gate_inner);
+       for (c3_w i = UW_MATCH_LEN; i > 0; i--)
+       {
+-        val = u3nc(u3k(mat_u[i - 1]), val);
++        val = u3nc(u3k(*mat_u[i - 1]), val);
+       }
+       //  u3z_save_m hands back our own reference
+       u3z(u3z_save_m(u3z_memo_keep, uw_mat_m, ctx, val));
+-- 
+2.52.0
+

@@ -1,0 +1,66 @@
+From 9e83198faf4cb2f75b90d982a2496e82a14551f3 Mon Sep 17 00:00:00 2001
+From: william arzt <bill@tlon.io>
+Date: Wed, 25 Nov 2026 11:35:04 -0500
+Subject: [PATCH] compile: add a hook that reports each function compilation
+
+Compiled code is laid out in the order functions are compiled. An embedder
+that compiles lazily and later needs the same layout again (to resume a
+suspended computation whose saved positions point into that code) has to
+know that order. Report it through an optional callback.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ source/m3_compile.c | 12 ++++++++++++
+ source/wasm3.h      |  7 +++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/source/m3_compile.c b/source/m3_compile.c
+index 624c86f..6eefa94 100644
+--- a/source/m3_compile.c
++++ b/source/m3_compile.c
+@@ -2719,12 +2719,24 @@ M3Result  ReserveConstants  (IM3Compilation o)
+ }
+ 
+ 
++// like the allocator setters, the hook is process-wide and not synchronized
++static void (* s_compileHook) (IM3Function, uint32_t) = NULL;
++
++void  m3_SetCompileHook  (void (* i_hook) (IM3Function, uint32_t))
++{
++    s_compileHook = i_hook;
++}
++
+ M3Result  CompileFunction  (IM3Function io_function)
+ {
+     M3Result result = m3Err_none;
+ 
+     if (!io_function->wasm) return "function body is missing";
+ 
++    // the layout of compiled code depends on the order functions are compiled in:
++    // let the embedder see that order, so that it can reproduce the layout
++    if (s_compileHook) s_compileHook (io_function, (uint32_t) (io_function - io_function->module->functions));
++
+     IM3FuncType funcType = io_function->funcType;                   m3log (compile, "compiling: [%d] %s %s; wasm-size: %d",
+                                                                         io_function->index, m3_GetFunctionName (io_function), SPrintFuncTypeSignature (funcType), (u32) (io_function->wasmEnd - io_function->wasm));
+     IM3Runtime runtime = io_function->module->runtime;
+diff --git a/source/wasm3.h b/source/wasm3.h
+index f2ae7c5..9a73643 100644
+--- a/source/wasm3.h
++++ b/source/wasm3.h
+@@ -263,6 +263,13 @@ d_m3ErrorConst  (SuspensionError,               "error during suspension")
+     // Optional, compiles all functions in the module
+     M3Result            m3_CompileModule            (IM3Module io_module);
+ 
++    // i_hook is called at the start of every function compilation, including the lazy
++    // ones that happen on a function's first call, with the function and its index in
++    // its module (stable across runs, unlike the handle). pass NULL to remove it.
++    // the hook is process-wide and not synchronized, like m3_SetAllocators: set it
++    // from the thread that compiles, before compiling
++    void                m3_SetCompileHook           (void (* i_hook)(IM3Function, uint32_t i_index));
++
+     // Calling m3_RunStart is optional
+     M3Result            m3_RunStart                 (IM3Module i_module);
+ 
+-- 
+2.52.0
+

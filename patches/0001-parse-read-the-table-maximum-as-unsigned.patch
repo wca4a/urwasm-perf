@@ -1,0 +1,37 @@
+From c0fc30784464a2ef9c7b957efd031a7c696c4392 Mon Sep 17 00:00:00 2001
+From: william arzt <bill@tlon.io>
+Date: Wed, 25 Nov 2026 13:20:25 -0500
+Subject: [PATCH] parse: read the table maximum as unsigned
+
+The table limit maximum was read with ReadLEB_i32. A one-byte value with
+bit 6 set (64 to 127, and the matching ranges of longer encodings) decodes
+as negative, and m3_ValidateModule then rejects a valid module as
+malformed. Read it as unsigned.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ source/m3_parse.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/source/m3_parse.c b/source/m3_parse.c
+index 0f33f3d..5ec2956 100644
+--- a/source/m3_parse.c
++++ b/source/m3_parse.c
+@@ -195,8 +195,12 @@ ParseSection_Table (M3Module * io_module, bytes_t i_bytes, cbytes_t i_end)
+             _( ReadLEB_u32(&table_lim_min, &i_bytes, i_end) );
+             if (flag == 1)
+             {
+-                _( ReadLEB_i32 (&table_lim_max, &i_bytes, i_end) );
+-                _throwif(m3Err_wasmMalformed, (table_lim_max < table_lim_min));
++                // limits are unsigned: read as signed, a maximum such as 102 (0x66) came out negative
++                u32 lim_max;
++                _( ReadLEB_u32 (&lim_max, &i_bytes, i_end) );
++                _throwif(m3Err_wasmMalformed, (lim_max < table_lim_min));
++                _throwif(m3Err_wasmMalformed, (lim_max > INT32_MAX));
++                table_lim_max = (i32) lim_max;
+             }
+             else if (flag != 0)
+             {
+-- 
+2.52.0
+

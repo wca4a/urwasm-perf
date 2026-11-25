@@ -1,0 +1,41 @@
+From d28899885d30063c8bb568848d5357cbf104520e Mon Sep 17 00:00:00 2001
+From: William Arzt <bill@tlon.io>
+Date: Tue, 24 Nov 2026 20:44:54 -0500
+Subject: [PATCH] compile: bounds-check the call frame against the slot table
+
+CompileCallArgsAndReturn places a callee's arguments and results above
+every slot currently in use and marks the result slots in m3Slots without
+checking the index. A function with a long chain of calls, each consuming
+the previous result (about 2,000 on a 4,000-slot table), walks topSlot past
+d_m3MaxFunctionSlots and writes beyond the array into the rest of
+M3Compilation and the runtime that embeds it. Loading such a module
+corrupts the code page lists and crashes the host.
+
+Refuse to compile with m3Err_functionStackOverflow instead, as the other
+slot allocators already do.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ source/m3_compile.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/source/m3_compile.c b/source/m3_compile.c
+index 624c86f..fd7c9ea 100644
+--- a/source/m3_compile.c
++++ b/source/m3_compile.c
+@@ -1542,6 +1542,12 @@ _       (Pop (o));
+     u16 numArgs = GetFuncTypeNumParams (i_type);
+     u16 numRets = GetFuncTypeNumResults (i_type);
+ 
++    // the callee's args and results are placed above every slot in use, so
++    // a long chain of calls climbs the slot table. refuse to compile, rather
++    // than write past the end of m3Slots.
++    _throwif (m3Err_functionStackOverflow,
++              (u32) topSlot + ((u32) numArgs + numRets) * c_ioSlotCount > d_m3MaxFunctionSlots);
++
+     u16 argTop = topSlot + (numArgs + numRets) * c_ioSlotCount;
+ 
+     while (numArgs--)
+-- 
+2.52.0
+

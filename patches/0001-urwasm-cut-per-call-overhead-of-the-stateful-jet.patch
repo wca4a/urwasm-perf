@@ -1,0 +1,590 @@
+From f1d2d9fc79074509fb965db398c009893be4b2eb Mon Sep 17 00:00:00 2001
+From: william arzt <bill@tlon.io>
+Date: Tue, 24 Nov 2026 20:45:24 -0500
+Subject: [PATCH 1/3] urwasm: cut per-call overhead of the stateful jet
+
+A stateful call (%gent/%rand) reloads the saved instance, runs, and saves
+it again. Four parts of that round trip cost far more than the call:
+
+- The ~20 Nock kicks that build the per-context match data (batteries and
+  contexts of the Lia arrows) ran on every call. Memoize them in the
+  persistent memo cache, keyed by the core context. The memo is bypassed
+  inside +mice, where the persistent cache is harvested and returned to
+  Hoon.
+
+- Every function in the module was recompiled on every call. Compile
+  lazily instead (wasm3 already compiles on first call via op_Compile).
+  Lazily compiled code is not laid out reproducibly, and a suspended
+  computation stores positions in compiled code, so: a state that is
+  already suspended is loaded eagerly as before, and a call that ends
+  suspended after a lazy load is discarded and redone eagerly from the
+  same saved state (held by reference, so a nested run on the same seed
+  cannot tombstone it away). Modules seen to suspend are remembered (by
+  mug, as a performance hint only). In lazy mode the code arena spills
+  into extra chunks instead of being moved and retried, since code may
+  be running in it.
+
+- Saving linear memory scanned it for trailing zeros a byte at a time.
+  Drop whole trailing zero pages with memcmp first.
+
+- The struct arena was saved at its full capacity (8 MB), zeroed, copied
+  and measured on every call. Save only the bytes in use.
+
+Measured on aarch64 macOS, ReleaseFast, per do-nothing call: 0.96 ms ->
+0.12 ms for a tiny module, 5.49 ms -> 0.22 ms for a 540 KB module,
+17.3 ms -> 2.2 ms with 64 MB of zeroed memory. tests/lib/wasm passes
+unchanged.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ pkg/noun/jets/e/urwasm.c | 393 ++++++++++++++++++++++++++++-----------
+ 1 file changed, 284 insertions(+), 109 deletions(-)
+
+diff --git a/pkg/noun/jets/e/urwasm.c b/pkg/noun/jets/e/urwasm.c
+index ec1b57c..1a0161f 100644
+--- a/pkg/noun/jets/e/urwasm.c
++++ b/pkg/noun/jets/e/urwasm.c
+@@ -92,6 +92,8 @@ uw_slam_nock(u3_noun gat, u3_noun sam)
+   return uw_kick_nock(cor, 2);
+ }
+ 
++#define UW_CHUNKS  40
++
+ // memory arena with exponential growth
+ typedef struct {
+   c3_h      siz_h;  // size in bytes
+@@ -102,6 +104,9 @@ typedef struct {
+   c3_y*     nex_y;  // next allocation
+   c3_y*     end_y;  // end of arena
+   jmp_buf*  esc_u;  // escape buffer
++  c3_t      laz_t;  // lazy code arena: spill into extra chunks, never escape
++  c3_w      chk_w;  // number of extra chunks
++  void*     chk_u[UW_CHUNKS];  // extra chunks
+ } uw_arena;
+ 
+ // Struct/array allocation: [len_d cap_d data]
+@@ -200,6 +205,25 @@ static_assert(
+   "u3we_run key tag must be a direct atom"
+ );
+ 
++//  memo tag for the per-context match data
++static const c3_m uw_mat_m = c3_s4('u','w','m','0');
++
++//  modules seen to suspend in this process: compile these eagerly.
++//  a performance hint only, any value here is safe.
++static c3_w _uw_eager_w[256];
++
++//  length without whole trailing zero pages (u3i_bytes strips the rest)
++static c3_w
++_uw_trim(const c3_y* buf_y, c3_w len_w)
++{
++  static const c3_y zer_y[4096];
++  while ( (len_w >= 4096) && (0 == memcmp(buf_y + len_w - 4096, zer_y, 4096)) )
++  {
++    len_w -= 4096;
++  }
++  return len_w;
++}
++
+ typedef struct {
+   u3_noun call_bat;
+   u3_noun memread_bat;
+@@ -229,6 +253,8 @@ typedef struct {
+   u3_noun set_all_glob_ctx;
+ } match_data_struct;
+ 
++#define UW_MATCH_LEN  (sizeof(match_data_struct) / sizeof(u3_noun))
++
+ typedef struct {
+   IM3Module wasm_module;    // p
+   u3_noun lia_shop;         // q,   transferred
+@@ -243,6 +269,7 @@ typedef struct {
+   u3_noun yil_previous;     // transferred
+   u3_noun queue;            // transferred
+   c3_t is_stateful;
++  c3_t laz_t;               // code is compiled on first call, not up front
+ } lia_state;
+ 
+ typedef enum {
+@@ -267,6 +294,8 @@ static void
+ _uw_arena_init_size(uw_arena* ren_u, c3_h siz_h)
+ {
+   ren_u->siz_h = siz_h;
++  ren_u->laz_t = 0;
++  ren_u->chk_w = 0;
+   u3i_slab_init(&ren_u->sab_u, 3, siz_h + 12);  // size + max padding
+   ren_u->buf_y = ren_u->nex_y = c3_align(ren_u->sab_u.buf_y, 16, C3_ALGHI);
+   ren_u->end_y = ren_u->buf_y + ren_u->siz_h;
+@@ -331,6 +360,12 @@ _uw_arena_free(uw_arena* ren_u)
+     u3m_bail(c3__fail);
+   }
+   u3i_slab_free(&ren_u->sab_u);
++  for (c3_w i = 0; i < ren_u->chk_w; i++)
++  {
++    u3a_free(ren_u->chk_u[i]);
++  }
++  ren_u->chk_w = 0;
++  ren_u->laz_t = 0;
+   ren_u->ini_t = 0;
+ }
+ 
+@@ -360,8 +395,29 @@ _calloc_code(size_t num_i, size_t len_i)
+   nex_y = c3_align(nex_y, 16, C3_ALGHI);
+   
+   if (nex_y >= CodeArena->end_y)
+-  { // OOM, jump out to increase the arena size and try again
+-    _longjmp(*CodeArena->esc_u, c3__code);
++  {
++    if (!CodeArena->laz_t)
++    { // OOM, jump out to increase the arena size and try again
++      _longjmp(*CodeArena->esc_u, c3__code);
++    }
++    //  lazy mode: this code is discarded before the state is saved, so it
++    //  does not have to be contiguous. spill into a fresh chunk instead of
++    //  moving the arena under running code.
++    //
++    if (CodeArena->chk_w >= UW_CHUNKS)
++    {
++      u3m_bail(c3__fail);
++    }
++    c3_d siz_d = (c3_d)1 << (20 + c3_min(CodeArena->chk_w, 8));
++    if (siz_d < byt_d + 64)
++    {
++      siz_d = byt_d + 64;
++    }
++    c3_y* chk_y = u3a_calloc(1, siz_d);
++    CodeArena->chk_u[CodeArena->chk_w++] = chk_y;
++    lag_v = c3_align(chk_y, 16, C3_ALGHI);
++    CodeArena->end_y = chk_y + siz_d;
++    nex_y = c3_align((c3_y*)lag_v + byt_d, 16, C3_ALGHI);
+   }
+ 
+   *((c3_d*)lag_v) = byt_d - 16;  // corruption check
+@@ -1871,11 +1927,9 @@ _link_wasm_with_arrow_map(
+ //        acc=*                                   ::  +254
+ //        susp_list=(list)                        ::  +255
+ //    ==
+-// arguments RETAINED
+-// on success allocates sat_u->wasm_module->runtime->memory.mallocated
+-// and initializes the arenas
+-static c3_t
+-_get_state(u3_noun hint, u3_noun seed, lia_state* sat_u)
++// seed RETAINED, produces the saved state (or u3_none, or ~ for a tombstone)
++static u3_weak
++_find_state(u3_noun seed)
+ {
+   //  u3_weak get = u3z_find_m(u3z_memo_keep, uw_run_m, seed);
+   //  XX order of search matters (sentinel value ~
+@@ -1886,7 +1940,19 @@ _get_state(u3_noun hint, u3_noun seed, lia_state* sat_u)
+   u3_noun key = u3z_key(uw_run_m, seed);
+   u3_weak get = u3z_find_up(key);
+   u3z(key);
+-  
++  return get;
++}
++
++// hint, seed RETAINED; get (a result of _find_state) TRANSFERRED
++// on success allocates sat_u->wasm_module->runtime->memory.mallocated
++// and initializes the arenas
++static c3_t
++_get_state(u3_noun hint,
++           u3_noun seed,
++           lia_state* sat_u,
++           c3_t laz_t,
++           u3_weak get)
++{
+   if (u3_none == get || u3_nul == get)
+   {
+     return 0;
+@@ -1941,10 +2007,23 @@ _get_state(u3_noun hint, u3_noun seed, lia_state* sat_u)
+     
+     _uw_arena_init_size(BoxArena, box_len_h);
+     u3r_bytes(pad_h, box_len_h, BoxArena->buf_y, q_box_buffer);
+-    _uw_arena_init(CodeArena);
+-
+     M3Result result;
+     IM3Runtime wasm3_runtime = (IM3Runtime)(BoxArena->buf_y + run_off_h);
++
++    //  a suspended computation holds positions in compiled code, which are
++    //  only reproducible if everything is compiled up front in a fixed order
++    //
++    laz_t = laz_t && (0 == wasm3_runtime->edge_suspend);
++    sat_u->laz_t = laz_t;
++    if (laz_t)
++    {
++      _uw_arena_init_size(CodeArena, (c3_h)1 << 20);
++      CodeArena->laz_t = 1;
++    }
++    else
++    {
++      _uw_arena_init(CodeArena);
++    }
+     wasm3_runtime->base = BoxArena->buf_y;
+     wasm3_runtime->base_transient = CodeArena->buf_y;
+     m3_RewritePointersRuntime(wasm3_runtime, BoxArena->buf_y, 0 /*is_store*/);
+@@ -1985,7 +2064,7 @@ _get_state(u3_noun hint, u3_noun seed, lia_state* sat_u)
+           }
+         }
+ 
+-        result = m3_CompileModule(wasm3_module);
++        result = laz_t ? m3Err_none : m3_CompileModule(wasm3_module);
+         if (result)
+         {
+           fprintf(stderr, ERR("compilation error: %s"), result);
+@@ -2040,7 +2119,14 @@ static u3_noun
+ _apply_diff(u3_noun input_tag, u3_noun p_input, lia_state* sat_u)
+ {
+   m3_SetAllocators(_calloc_bail, _free_bail, _realloc_bail);
+-  m3_SetTransientAllocators(_calloc_bail, _free_bail, _realloc_bail);
++  if (sat_u->laz_t)
++  {
++    m3_SetTransientAllocators(_calloc_code, _free_code, _realloc_code);
++  }
++  else
++  {
++    m3_SetTransientAllocators(_calloc_bail, _free_bail, _realloc_bail);
++  }
+   m3_SetMemoryAllocators(u3a_calloc, u3a_free, u3a_realloc);
+ 
+   if (input_tag == c3y)
+@@ -2182,7 +2268,8 @@ _move_state(
+     u3m_bail(c3__fail);
+   }
+ 
+-  u3_atom q_buf = u3i_bytes(len_buf_w, (c3_y*)(mem_u + 1));
++  u3_atom q_buf = u3i_bytes(_uw_trim((c3_y*)(mem_u + 1), len_buf_w),
++                            (c3_y*)(mem_u + 1));
+ 
+   u3a_free(mem_u);
+ 
+@@ -2195,7 +2282,14 @@ _move_state(
+   
+   _uw_arena_free(CodeArena);
+ 
+-  c3_h box_len_h = BoxArena->siz_h;
++  //  a freshly instantiated arena has headroom it will never use again:
++  //  nothing allocates from it once the state is loaded back. record only
++  //  the bytes in use, so later loads and saves do not touch the rest.
++  //  (a loaded arena has made no allocations and is already exact.)
++  //
++  c3_h box_use_h = (c3_h)(BoxArena->nex_y - BoxArena->buf_y);
++  c3_h box_len_h = box_use_h ? c3_min(box_use_h, BoxArena->siz_h)
++                             : BoxArena->siz_h;
+   if (u3a_direct_max_h < box_len_h)
+   {
+     u3m_bail(c3__fail);
+@@ -2263,11 +2357,139 @@ u3we_lia_run_v1(u3_noun cor)
+   u3_noun input = u3at(u3x_sam_2, cor);
+   u3_noun seed = u3at(u3x_sam_6, cor);
+   
+-  u3_noun runnable = uw_kick_nock(u3k(ctx), AX_RUNNABLE);
+-  u3_noun arrows   = KICK1(uw_kick_nock(u3k(ctx), AX_ARROWS));
++  //  everything below depends only on the context, so compute it once
++  //
++  u3_noun try_gate_inner;
++  match_data_struct match;
++  //  inside +mice (u3a_flag_cash) the persistent cache is harvested and
++  //  returned to Hoon, so neither read it (a hit is copied into the
++  //  harvested road) nor add to it there
++  //
++  c3_t    mem_t = !(u3R->how.fag_w & u3a_flag_cash);
++  u3_weak mat_get = mem_t ? u3z_find_m(u3z_memo_keep, uw_mat_m, ctx) : u3_none;
++  if ( u3_none != mat_get )
++  {
++    u3_noun* mat_u = (u3_noun*)&match;
++    u3_noun  lit = mat_get;
++    for (c3_w i = 0; i < UW_MATCH_LEN; i++)
++    {
++      mat_u[i] = u3k(u3h(lit));
++      lit = u3t(lit);
++    }
++    try_gate_inner = u3k(lit);
++    u3z(mat_get);
++  }
++  else
++  {
++    u3_noun runnable = uw_kick_nock(u3k(ctx), AX_RUNNABLE);
++    u3_noun arrows   = KICK1(uw_kick_nock(u3k(ctx), AX_ARROWS));
++
++    u3_noun try_gate = uw_kick_nock(u3k(runnable), AX_TRY);
++    try_gate_inner = KICK1(try_gate);
++
++    u3_noun call_script         = KICK1(uw_kick_nock(u3k(arrows), AX_CALL));  
++    u3_noun memread_script      = KICK1(uw_kick_nock(u3k(arrows), AX_MEMREAD));  
++    u3_noun memwrite_script     = KICK1(uw_kick_nock(u3k(arrows), AX_MEMWRITE));  
++    u3_noun call_ext_script     = KICK1(uw_kick_nock(u3k(arrows), AX_CALL_EXT));
++    u3_noun global_set_script   = KICK1(uw_kick_nock(u3k(arrows), AX_GLOBAL_SET));
++    u3_noun global_get_script   = KICK1(uw_kick_nock(u3k(arrows), AX_GLOBAL_GET));
++    u3_noun mem_grow_script     = KICK1(uw_kick_nock(u3k(arrows), AX_MEM_GROW));
++    u3_noun mem_size_script     =       uw_kick_nock(u3k(arrows), AX_MEM_SIZE);
++    u3_noun get_acc_script      =       uw_kick_nock(u3k(arrows), AX_GET_ACC);
++    u3_noun set_acc_script      = KICK1(uw_kick_nock(u3k(arrows), AX_SET_ACC));
++    u3_noun get_all_glob_script =       uw_kick_nock(u3k(arrows), AX_GET_ALL_GLOB);
++    u3_noun set_all_glob_script = KICK1(uw_kick_nock(    arrows,  AX_SET_ALL_GLOB));
++
++    u3_noun try_script    = KICK1(u3k(try_gate_inner));
++    u3_noun catch_script  = KICK2(uw_kick_nock(u3k(runnable), AX_CATCH));
++    u3_noun return_script = KICK1(uw_kick_nock(u3k(runnable), AX_RETURN));
++    u3_noun fail_script =         uw_kick_nock(    runnable,  AX_FAIL);
++  
++    u3_noun call_bat = u3k(u3h(call_script));
++    u3_noun memread_bat = u3k(u3h(memread_script));
++    u3_noun memwrite_bat = u3k(u3h(memwrite_script));
++    u3_noun call_ext_bat = u3k(u3h(call_ext_script));
++    u3_noun try_bat = u3k(u3h(try_script));
++    u3_noun catch_bat = u3k(u3h(catch_script));
++    u3_noun return_bat = u3k(u3h(return_script));
++    u3_noun fail_bat = u3k(u3h(fail_script));
++    u3_noun global_set_bat = u3k(u3h(global_set_script));
++    u3_noun global_get_bat = u3k(u3h(global_get_script));
++    u3_noun mem_grow_bat = u3k(u3h(mem_grow_script));
++    u3_noun mem_size_bat = u3k(u3h(mem_size_script));
++    u3_noun get_acc_bat = u3k(u3h(get_acc_script));
++    u3_noun set_acc_bat = u3k(u3h(set_acc_script));
++    u3_noun get_all_glob_bat = u3k(u3h(get_all_glob_script));
++    u3_noun set_all_glob_bat = u3k(u3h(set_all_glob_script));
++
++    u3_noun call_ctx = u3k(u3at(ARROW_CTX, call_script));
++    u3_noun memread_ctx = u3k(u3at(ARROW_CTX, memread_script));
++    u3_noun memwrite_ctx = u3k(u3at(ARROW_CTX, memwrite_script));
++    u3_noun global_set_ctx = u3k(u3at(ARROW_CTX, global_set_script));
++    u3_noun global_get_ctx = u3k(u3at(ARROW_CTX, global_get_script));
++    u3_noun mem_grow_ctx = u3k(u3at(ARROW_CTX, mem_grow_script));
++    u3_noun mem_size_ctx = u3k(u3at(MONAD_CTX, mem_size_script));
++    u3_noun get_all_glob_ctx = u3k(u3at(MONAD_CTX, get_all_glob_script));
++    u3_noun set_all_glob_ctx = u3k(u3at(ARROW_CTX, set_all_glob_script));
++
++    u3z(call_script);
++    u3z(memread_script);
++    u3z(memwrite_script);
++    u3z(call_ext_script);
++    u3z(try_script);
++    u3z(catch_script);
++    u3z(return_script);
++    u3z(fail_script);
++    u3z(global_set_script);
++    u3z(global_get_script);
++    u3z(mem_grow_script);
++    u3z(mem_size_script);
++    u3z(get_acc_script);
++    u3z(set_acc_script);
++    u3z(get_all_glob_script);
++    u3z(set_all_glob_script);
++  
++    match = (match_data_struct){
++      call_bat,
++      memread_bat,
++      memwrite_bat,
++      call_ext_bat,
++      try_bat,
++      catch_bat,
++      return_bat,
++      fail_bat,
++      global_set_bat,
++      global_get_bat,
++      mem_grow_bat,
++      mem_size_bat,
++      get_acc_bat,
++      set_acc_bat,
++      get_all_glob_bat,
++      set_all_glob_bat,
++    //
++      call_ctx,
++      memread_ctx,
++      memwrite_ctx,
++      global_set_ctx,
++      global_get_ctx,
++      mem_grow_ctx,
++      mem_size_ctx,
++      get_all_glob_ctx,
++      set_all_glob_ctx,
++    };
+ 
+-  u3_noun try_gate = uw_kick_nock(u3k(runnable), AX_TRY);
+-  u3_noun try_gate_inner = KICK1(try_gate);
++    if ( mem_t )
++    {
++      u3_noun* mat_u = (u3_noun*)&match;
++      u3_noun  val = u3k(try_gate_inner);
++      for (c3_w i = UW_MATCH_LEN; i > 0; i--)
++      {
++        val = u3nc(u3k(mat_u[i - 1]), val);
++      }
++      //  u3z_save_m hands back our own reference
++      u3z(u3z_save_m(u3z_memo_keep, uw_mat_m, ctx, val));
++    }
++  }
+ 
+   u3_noun seed_new;  
+   u3_noun input_tag, p_input;
+@@ -2304,96 +2526,6 @@ u3we_lia_run_v1(u3_noun cor)
+     return u3m_bail(c3__fail);
+   }
+ 
+-  u3_noun call_script         = KICK1(uw_kick_nock(u3k(arrows), AX_CALL));  
+-  u3_noun memread_script      = KICK1(uw_kick_nock(u3k(arrows), AX_MEMREAD));  
+-  u3_noun memwrite_script     = KICK1(uw_kick_nock(u3k(arrows), AX_MEMWRITE));  
+-  u3_noun call_ext_script     = KICK1(uw_kick_nock(u3k(arrows), AX_CALL_EXT));
+-  u3_noun global_set_script   = KICK1(uw_kick_nock(u3k(arrows), AX_GLOBAL_SET));
+-  u3_noun global_get_script   = KICK1(uw_kick_nock(u3k(arrows), AX_GLOBAL_GET));
+-  u3_noun mem_grow_script     = KICK1(uw_kick_nock(u3k(arrows), AX_MEM_GROW));
+-  u3_noun mem_size_script     =       uw_kick_nock(u3k(arrows), AX_MEM_SIZE);
+-  u3_noun get_acc_script      =       uw_kick_nock(u3k(arrows), AX_GET_ACC);
+-  u3_noun set_acc_script      = KICK1(uw_kick_nock(u3k(arrows), AX_SET_ACC));
+-  u3_noun get_all_glob_script =       uw_kick_nock(u3k(arrows), AX_GET_ALL_GLOB);
+-  u3_noun set_all_glob_script = KICK1(uw_kick_nock(    arrows,  AX_SET_ALL_GLOB));
+-
+-  u3_noun try_script    = KICK1(try_gate_inner);
+-  u3_noun catch_script  = KICK2(uw_kick_nock(u3k(runnable), AX_CATCH));
+-  u3_noun return_script = KICK1(uw_kick_nock(u3k(runnable), AX_RETURN));
+-  u3_noun fail_script =         uw_kick_nock(    runnable,  AX_FAIL);
+-  
+-  u3_noun call_bat = u3k(u3h(call_script));
+-  u3_noun memread_bat = u3k(u3h(memread_script));
+-  u3_noun memwrite_bat = u3k(u3h(memwrite_script));
+-  u3_noun call_ext_bat = u3k(u3h(call_ext_script));
+-  u3_noun try_bat = u3k(u3h(try_script));
+-  u3_noun catch_bat = u3k(u3h(catch_script));
+-  u3_noun return_bat = u3k(u3h(return_script));
+-  u3_noun fail_bat = u3k(u3h(fail_script));
+-  u3_noun global_set_bat = u3k(u3h(global_set_script));
+-  u3_noun global_get_bat = u3k(u3h(global_get_script));
+-  u3_noun mem_grow_bat = u3k(u3h(mem_grow_script));
+-  u3_noun mem_size_bat = u3k(u3h(mem_size_script));
+-  u3_noun get_acc_bat = u3k(u3h(get_acc_script));
+-  u3_noun set_acc_bat = u3k(u3h(set_acc_script));
+-  u3_noun get_all_glob_bat = u3k(u3h(get_all_glob_script));
+-  u3_noun set_all_glob_bat = u3k(u3h(set_all_glob_script));
+-
+-  u3_noun call_ctx = u3k(u3at(ARROW_CTX, call_script));
+-  u3_noun memread_ctx = u3k(u3at(ARROW_CTX, memread_script));
+-  u3_noun memwrite_ctx = u3k(u3at(ARROW_CTX, memwrite_script));
+-  u3_noun global_set_ctx = u3k(u3at(ARROW_CTX, global_set_script));
+-  u3_noun global_get_ctx = u3k(u3at(ARROW_CTX, global_get_script));
+-  u3_noun mem_grow_ctx = u3k(u3at(ARROW_CTX, mem_grow_script));
+-  u3_noun mem_size_ctx = u3k(u3at(MONAD_CTX, mem_size_script));
+-  u3_noun get_all_glob_ctx = u3k(u3at(MONAD_CTX, get_all_glob_script));
+-  u3_noun set_all_glob_ctx = u3k(u3at(ARROW_CTX, set_all_glob_script));
+-
+-  u3z(call_script);
+-  u3z(memread_script);
+-  u3z(memwrite_script);
+-  u3z(call_ext_script);
+-  u3z(try_script);
+-  u3z(catch_script);
+-  u3z(return_script);
+-  u3z(fail_script);
+-  u3z(global_set_script);
+-  u3z(global_get_script);
+-  u3z(mem_grow_script);
+-  u3z(mem_size_script);
+-  u3z(get_acc_script);
+-  u3z(set_acc_script);
+-  u3z(get_all_glob_script);
+-  u3z(set_all_glob_script);
+-  
+-  match_data_struct match = {
+-    call_bat,
+-    memread_bat,
+-    memwrite_bat,
+-    call_ext_bat,
+-    try_bat,
+-    catch_bat,
+-    return_bat,
+-    fail_bat,
+-    global_set_bat,
+-    global_get_bat,
+-    mem_grow_bat,
+-    mem_size_bat,
+-    get_acc_bat,
+-    set_acc_bat,
+-    get_all_glob_bat,
+-    set_all_glob_bat,
+-  //
+-    call_ctx,
+-    memread_ctx,
+-    memwrite_ctx,
+-    global_set_ctx,
+-    global_get_ctx,
+-    mem_grow_ctx,
+-    mem_size_ctx,
+-    get_all_glob_ctx,
+-    set_all_glob_ctx,
+-  };
+ 
+   lia_state sat;
+ 
+@@ -2404,12 +2536,50 @@ u3we_lia_run_v1(u3_noun cor)
+   if (!omit_t)
+   {
+     sat.is_stateful = 1;
+-    if (_get_state(hint, seed, &sat))
++    sat.laz_t = 0;
++    c3_w mug_w = u3r_mug(u3at(seed_module, seed));
++    //  keep our own reference to the saved state: a nested run:wasm on the
++    //  same seed (from an import) may replace it in the cache with a
++    //  tombstone, and the eager redo below must load the same state again
++    //
++    u3_weak sav = _find_state(seed);
++    c3_t    hit_t = _get_state(hint, seed, &sat,
++                               (_uw_eager_w[mug_w & 255] != mug_w),
++                               (u3_none == sav) ? u3_none : u3k(sav));
++    if ( hit_t )
+     {
+       sat.map = u3t(u3at(seed_import, seed));
+       sat.match = &match;
+       sat.resolution = u3_none;
+       yil = _apply_diff(input_tag, p_input, &sat);
++
++      if ( sat.laz_t && sat.wasm_module->runtime->edge_suspend )
++      {
++        //  the call ended suspended after lazy compilation: the saved
++        //  positions in code would not be reproducible on the next load.
++        //  discard this attempt and redo it with eager compilation, and
++        //  remember that this module suspends.
++        //
++        _uw_eager_w[mug_w & 255] = mug_w;
++        u3z(yil);
++        u3z(sat.lia_shop);
++        u3z(sat.susp_list);
++        u3z(sat.yil_previous);
++        u3z(sat.queue);
++        u3z(sat.acc);
++        u3a_free(sat.wasm_module->runtime->memory.mallocated);
++        _uw_arena_free(CodeArena);
++        _uw_arena_free(BoxArena);
++
++        if ( !_get_state(hint, seed, &sat, 0, u3k(sav)) )
++        {
++          return u3m_bail(c3__fail);
++        }
++        sat.map = u3t(u3at(seed_import, seed));
++        sat.match = &match;
++        sat.resolution = u3_none;
++        yil = _apply_diff(input_tag, p_input, &sat);
++      }
+     }
+     else
+     { // instantiate state with retries
+@@ -2594,6 +2764,10 @@ u3we_lia_run_v1(u3_noun cor)
+       }
+     }
+ 
++    if ( u3_none != sav )
++    {
++      u3z(sav);
++    }
+     _move_state(&sat, seed, seed_new, hint, yil);
+   }
+   else
+@@ -2747,6 +2921,7 @@ u3we_lia_run_v1(u3_noun cor)
+     u3z(sat.queue);
+   }
+ 
++  u3z(try_gate_inner);
+   u3z(match.call_bat);
+   u3z(match.memread_bat);
+   u3z(match.memwrite_bat);
+-- 
+2.52.0
+

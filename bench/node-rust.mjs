@@ -1,0 +1,14 @@
+import fs from 'fs';
+const {instance:{exports:e}} = await WebAssembly.instantiate(fs.readFileSync(process.argv[2]), {});
+const u = x => x >>> 0, t = f => { const a = performance.now(); const r = f(); return [u(r), (performance.now()-a).toFixed(3)+'ms']; };
+console.log('imports ok; exports', Object.keys(e).join(' '));
+console.log('hash(1)', u(e.hash(1)).toString(16));
+let r; for (let i=0;i<50;i++) r = e.tick(); console.log('tick x50', r);
+for (let i=0;i<50;i++) r = e.put(i); console.log('put x50', u(r));
+for (let i=0;i<50;i++) r = e.get(i); console.log('get(49)', u(r));
+console.log('fill(20000)', ...t(()=>e.fill(20000)));
+console.log('scan', ...t(()=>e.scan()));
+console.log('sort(1000000)', ...t(()=>e.sort(1000000)));
+console.log('hash(200000)', ...t(()=>e.hash(200000)));
+console.log('grow(4096)', ...t(()=>e.grow(4096)));
+console.log('tick', e.tick(), 'memory MB', e.memory.buffer.byteLength/1048576);
