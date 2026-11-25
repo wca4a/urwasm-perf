@@ -290,3 +290,16 @@ urbit/wasm3 reads a table's maximum size with `ReadLEB_i32`. A maximum of 64 to 
 16383 and so on) decodes negative and `m3_ValidateModule` rejects a valid module ("validation error: malformed Wasm binary").
 The first poker build had a table of 102 and failed on both runtimes. Workaround in the module: link with `--growable-table`
 (bench/poker/.cargo/config.toml). Fix: local wasm3 branch `fix-table-limit-leb` c0fc307, patch in `patches/`. Not pushed.
+
+## Sealed deck for hold'em (2026-11-25)
+
+Commit-reveal shuffle in wca4a/urbit-holdem: the engine fixes a 32-byte secret from ship entropy (4 import calls) and publishes
+its SHA-256; each browser adds 16 random bytes; deck = public recipe over secret, numbers and hand number (SHA-256 stream,
+unbiased Fisher-Yates); after the hand the secret, numbers and deck are published and every browser re-derives and checks.
+Three independent implementations of the recipe (Rust engine, JavaScript page with its own SHA-256, Python seat script).
+
+Checks: native tests 4/4; `test/verify.mjs`: 300 bot hands, 1,495 player-checks, every check line true, six kinds of tampering
+all caught; ship replay 905 of 905 replies identical to Node on original and patched runtimes; two browser tabs each showed
+"Hand 1 checked: the deal was fair" with all six lines passing.
+Per move on the ship (noisy machine): patched 3.5 ms, original 6.8 ms; deal patched 6.6 ms, original 25 ms.
+Does not hide the cards from the ship operator, and does not stop a player colluding with the ship from grinding their number.
