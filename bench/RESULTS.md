@@ -334,3 +334,56 @@ What an app can do today (`+steps ... %lean`): reserve the request buffer once a
 
 What the library could do: give the script forms a cheap default sample (compute the lia-state default once per `arrows`
 core, not per form). That changes core layout the jet depends on (context axes), so kernel and runtime would change together.
+
+## Keeping instances alive between calls (2026-11-26)
+
+vere branch `urwasm-hot` = `urwasm-fast-clean` + one commit (2b5c419, `patches/0004-...`). Local test build: `urwasm-hot-test`
+(adds the mdns guard, the test wasm3, and a `URWASM_COLD` switch that turns keep-alive off for comparison).
+
+What it does: after a call the instance (struct arena, compiled code, wasm memory) stays in C-heap memory, in one of 8 slots
+(512 MB ceiling in total, 256 MB wasm memory per instance, 256 MB of reserved address space for code each). The next call on the
+state just saved reuses it: no copy in, no relink, no recompile. Every call still writes the full saved state to the memo cache,
+which stays the source of truth.
+
+How it stays correct: each save writes a fresh random id after the struct image in the saved state and gives the same id to the
+live instance; an instance has no id while a call runs on it. A call uses a live instance only if the saved state it found for
+its seed carries that instance's id. Rolled-back events, branches, restarts and cache trims all end in "ids differ", which means
+load from the saved state as before. A bail during a call on a live instance is caught in the jet (same road, its own setjmp),
+the instance is dropped, and the bail is re-raised. An event aborted by a signal skips that; such a slot is reclaimed when a
+later call arrives from a frame that is not deeper than the one that owned it.
+Not used inside +mice, nor for %oust.
+
+Bug found on the way: my first version passed an 8-byte buffer to `c3_rand()`, which fills 64. Fixed.
+
+Checks (keep-alive on, and off with the same build):
+- upstream wasm tests 48/48, same results as the original runtime
+- notes 814/814, SQL 367/367, poker 905/905 replies identical to Node, on and off
+- `bench/hot-test.hoon`, 44 checks, identical output on and off: sequence; a call whose surrounding computation then crashes
+  (rollback); a call that crashes halfway after changing the instance (trap path, seen firing); branching from an older seed;
+  12 instances in rotation through 8 slots (eviction)
+- restart and mixing runtimes on one ship: 3 notes + SQL table on this build, stop, 2 more on the ORIGINAL runtime, stop,
+  2 more on this build: ids 1..7 continuous, SQL rows a,b,c,d. Saved states are read correctly both ways.
+- with tracing on, the SQL replay reused the live instance on 385 of 386 calls.
+
+Profile of the SQL replay inside the jet (macOS `sample`):
+
+| | keep-alive off | on |
+|---|---|---|
+| wasm actually running | 70% | 91% |
+| wasm3 preparing code | 21% | 0% |
+| Hoon script steps | 6% | 7% |
+| loading state | 1% | 0% |
+
+Time per request (median; the machine was busy with an unrelated job, so treat as indicative):
+
+| workload | off | on |
+|---|---|---|
+| notes (814) | 2.33 ms | 1.49 ms |
+| SQL (367) | 7.42 ms | 2.90 ms |
+| poker (905) | 3.61 ms | 3.34 ms |
+| one notes request, 5 steps (`+steps %all`) | 1.95 to 2.22 ms | 1.26 to 1.38 ms |
+| same in the lean style (`%lean`) | 1.40 to 1.49 ms | 0.70 to 0.83 ms |
+
+After this the SQL workload is 91% interpreter time: the remaining gap to Node there is wasm3 itself.
+Not tested: the signal-abort reclaim; behaviour under real memory pressure; Windows (keep-alive is compiled out there).
+Not reviewed by anyone else yet.

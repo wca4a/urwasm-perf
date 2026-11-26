@@ -1,0 +1,762 @@
+From 2b5c4196fb5794c5beecb50fcc3c5b6c89e38243 Mon Sep 17 00:00:00 2001
+From: william arzt <bill@tlon.io>
+Date: Thu, 26 Nov 2026 14:38:54 -0500
+Subject: [PATCH] urwasm: keep instances alive between calls
+
+Loading a saved state costs a copy of its structs and its memory, a
+relink of its imports and a recompile of whatever it then runs. Keep the
+instance alive after a call, outside the loom, so that the next call can
+carry on with it.
+
+This is an accelerator only. Every call still saves the full state in the
+memo cache as before, and that saved state stays the source of truth. A
+live instance is used only when the saved state for the seed being run
+says it is that instance as it was left: a random id is written after
+the struct image in the saved state and held by the instance, a new one
+on every save, and none while a call is running on it. If the event is
+rolled back, a call bails halfway, the process restarts or the cache is
+trimmed, the ids no longer match and the state is loaded the ordinary
+way. A bail during a call on a live instance is caught in the jet, the
+instance dropped, and the bail sent on.
+
+Saved states are unchanged for a runtime without this (the id sits past
+the bytes it reads).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ pkg/noun/jets/e/urwasm.c | 518 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 499 insertions(+), 19 deletions(-)
+
+diff --git a/pkg/noun/jets/e/urwasm.c b/pkg/noun/jets/e/urwasm.c
+index 4682a49b67..143c7f0d85 100644
+--- a/pkg/noun/jets/e/urwasm.c
++++ b/pkg/noun/jets/e/urwasm.c
+@@ -107,6 +107,7 @@ typedef struct {
+   c3_t      laz_t;  // lazy code arena: spill into extra chunks, never escape
+   c3_w      chk_w;  // number of extra chunks
+   c3_d      tot_d;  // bytes handed out, extra chunks included
++  c3_t      hot_t;  // the buffer belongs to a live instance (uw_hot), not to us
+   void*     chk_u[UW_CHUNKS];  // extra chunks
+ } uw_arena;
+ 
+@@ -313,6 +314,7 @@ typedef struct {
+   c3_h orc_h;               // capacity
+   c3_t ork_t;               // the state was loaded from the uw_ord_m cache
+   c3_t cas_t;               // running inside +mice (u3a_flag_cash)
++  void* hot_v;              // the live instance (uw_hot) this state is in, or NULL
+ } lia_state;
+ 
+ typedef enum {
+@@ -340,6 +342,7 @@ _uw_arena_init_size(uw_arena* ren_u, c3_h siz_h)
+   ren_u->laz_t = 0;
+   ren_u->chk_w = 0;
+   ren_u->tot_d = 0;
++  ren_u->hot_t = 0;
+   u3i_slab_init(&ren_u->sab_u, 3, siz_h + 12);  // size + max padding
+   ren_u->buf_y = ren_u->nex_y = c3_align(ren_u->sab_u.buf_y, 16, C3_ALGHI);
+   ren_u->end_y = ren_u->buf_y + ren_u->siz_h;
+@@ -352,6 +355,21 @@ _uw_arena_init_size(uw_arena* ren_u, c3_h siz_h)
+   ren_u->ini_t = 1;
+ }
+ 
++//  an arena over a buffer that a live instance owns and frees
++static void
++_uw_arena_init_heap(uw_arena* ren_u, c3_y* buf_y, c3_h siz_h)
++{
++  ren_u->siz_h = siz_h;
++  ren_u->laz_t = 0;
++  ren_u->chk_w = 0;
++  ren_u->tot_d = 0;
++  ren_u->hot_t = 1;
++  ren_u->pad_y = 0;
++  ren_u->buf_y = ren_u->nex_y = buf_y;
++  ren_u->end_y = buf_y + siz_h;
++  ren_u->ini_t = 1;
++}
++
+ static void
+ _uw_arena_init(uw_arena* ren_u)
+ {
+@@ -405,6 +423,11 @@ _uw_arena_free(uw_arena* ren_u)
+   {
+     u3m_bail(c3__fail);
+   }
++  if ( ren_u->hot_t )
++  {
++    ren_u->ini_t = 0;
++    return;
++  }
+   u3i_slab_free(&ren_u->sab_u);
+   for (c3_w i = 0; i < ren_u->chk_w; i++)
+   {
+@@ -415,6 +438,171 @@ _uw_arena_free(uw_arena* ren_u)
+   ren_u->ini_t = 0;
+ }
+ 
++//  LIVE INSTANCES
++//
++//  Loading a saved state costs a copy of its structs and its memory, a
++//  relink of its imports and a recompile of whatever it runs. So after a
++//  call the instance is kept alive, outside the loom, for the next call to
++//  pick up where this one left off.
++//
++//  This is an accelerator and nothing else. Every call still saves the
++//  full state in the memo cache exactly as before, and that saved state
++//  stays the only source of truth: a live instance is used only when the
++//  saved state for the seed being run says it is that instance, as it was
++//  left. The link is a random id written after the struct image in the
++//  saved state (where a runtime without this reads nothing) and held by the
++//  instance. A new id is made on every save, and an instance has no id
++//  while a call is running on it. So whatever else happens (the event is
++//  rolled back, a call bails halfway, the process restarts, the cache is
++//  trimmed) the ids stop matching, and the state is loaded from the cache
++//  the ordinary way.
++//
++#ifndef U3_OS_windows
++#  include <sys/mman.h>
++#  define UW_HOT        8                     //  instances kept
++#  define UW_HOT_CODE   ((c3_h)1 << 28)       //  code room each, reserved not used
++#  define UW_HOT_MEM    ((c3_d)1 << 28)       //  largest wasm memory kept live
++#  define UW_HOT_ALL    ((c3_d)1 << 29)       //  structs and memory kept, in total
++#else
++#  define UW_HOT        0
++#endif
++
++//  u3m_trap() and u3m_escape() as manage.c has them, for catching a bail in
++//  the road we are already in
++#ifndef VERE64
++#  define uw_trap(why)    ( 0 == ((why) = (u3_noun)_setjmp(u3R->esc.buf)) )
++#  define uw_escape(how)  do { _longjmp(u3R->esc.buf, (how)); } while ( 0 )
++#else
++#  define uw_trap(why)    ( _setjmp(u3R->esc.buf) ? ((why) = u3R->esc.why_w, 0) : 1 )
++#  define uw_escape(how)  do { u3R->esc.why_w = (how); _longjmp(u3R->esc.buf, 1); } while ( 0 )
++#endif
++
++typedef struct {
++  c3_y       sat_y;         //  0 free, 1 ready, 2 a call is running on it
++  c3_d       idh_d, idl_d;  //  id of the saved state this is the live form of
++  c3_d       use_d;         //  last use, for eviction
++  void*      own_v;         //  address in the frame running on it
++  c3_y*      box_y;         //  struct arena (malloc)
++  c3_h       box_h;
++  c3_y*      cod_y;         //  code arena (mmap)
++  void*      mem_v;         //  wasm memory block (malloc), kept current
++  void**     fun_v;         //  scratch: per-function pointers across a save
++  lia_state  sat_u;
++} uw_hot;
++
++#if UW_HOT
++static uw_hot   _uw_hot_u[UW_HOT];
++static uw_hot*  _uw_hot_cur;    //  instance whose wasm memory is being served
++static c3_d     _uw_hot_seq_d;  //  ids and use stamps
++static c3_d     _uw_hot_non_d;  //  per process
++
++static void
++_uw_hot_free(uw_hot* hot_u)
++{
++  if ( hot_u->box_y ) free(hot_u->box_y);
++  if ( hot_u->cod_y ) munmap(hot_u->cod_y, UW_HOT_CODE);
++  if ( hot_u->mem_v ) free(hot_u->mem_v);
++  if ( hot_u->fun_v ) free(hot_u->fun_v);
++  if ( hot_u->sat_u.orc_h ) free(hot_u->sat_u.ord_h);
++  hot_u->box_y = hot_u->cod_y = NULL;
++  hot_u->mem_v = NULL;
++  hot_u->fun_v = NULL;
++  hot_u->sat_u.ord_h = NULL;
++  hot_u->sat_u.orn_h = hot_u->sat_u.orc_h = 0;
++  hot_u->sat_u.rec_t = 0;
++  hot_u->idh_d = hot_u->idl_d = 0;
++  hot_u->sat_y = 0;
++}
++
++//  the ready instance with this id, if any
++static uw_hot*
++_uw_hot_find(c3_d idh_d, c3_d idl_d)
++{
++  if ( !idh_d ) return NULL;
++  for (c3_w i = 0; i < UW_HOT; i++)
++  {
++    uw_hot* hot_u = &_uw_hot_u[i];
++    if ( (1 == hot_u->sat_y) && (hot_u->idh_d == idh_d) && (hot_u->idl_d == idl_d) )
++    {
++      return hot_u;
++    }
++  }
++  return NULL;
++}
++
++//  bytes of structs and wasm memory an instance holds
++static c3_d
++_uw_hot_size(uw_hot* hot_u)
++{
++  return (c3_d)hot_u->box_h
++       + (hot_u->mem_v ? (c3_d)((M3MemoryHeader*)hot_u->mem_v)->length : 0);
++}
++
++//  an empty slot to build an instance of ned_d bytes in, or NULL. now_v is
++//  an address in the caller's frame. the least recently used instances make
++//  way, for the slot and for the total.
++static uw_hot*
++_uw_hot_take(void* now_v, c3_d ned_d)
++{
++  while ( 1 )
++  {
++    uw_hot* fre_u = NULL;
++    uw_hot* old_u = NULL;
++    c3_d    all_d = ned_d;
++    for (c3_w i = 0; i < UW_HOT; i++)
++    {
++      uw_hot* hot_u = &_uw_hot_u[i];
++      //  marked running, by a frame that cannot still exist: a frame that
++      //  called us would be above us on the stack. (a bail is caught and
++      //  cleans up; this is for an event aborted by a signal, which is not.)
++      //
++      if ( (2 == hot_u->sat_y) && ((c3_p)now_v >= (c3_p)hot_u->own_v) )
++      {
++        _uw_hot_free(hot_u);
++      }
++      if ( 0 == hot_u->sat_y )
++      {
++        if ( !fre_u ) fre_u = hot_u;
++        continue;
++      }
++      all_d += _uw_hot_size(hot_u);
++      if ( (1 == hot_u->sat_y) && (!old_u || (hot_u->use_d < old_u->use_d)) )
++      {
++        old_u = hot_u;
++      }
++    }
++    if ( fre_u && (all_d <= UW_HOT_ALL) ) return fre_u;
++    if ( !old_u ) return NULL;
++    _uw_hot_free(old_u);
++  }
++}
++
++//  wasm memory of the live instance: plain heap, and we track the block
++//
++static void*
++_uw_hot_calloc(size_t num_i, size_t len_i)
++{
++  void* ptr_v = calloc(num_i, len_i);
++  if ( ptr_v && _uw_hot_cur ) _uw_hot_cur->mem_v = ptr_v;
++  return ptr_v;
++}
++
++static void
++_uw_hot_mfree(void* ptr_v)
++{
++  if ( _uw_hot_cur && (_uw_hot_cur->mem_v == ptr_v) ) _uw_hot_cur->mem_v = NULL;
++  free(ptr_v);
++}
++
++static void*
++_uw_hot_realloc(void* ptr_v, size_t old_i, size_t new_i)
++{
++  void* new_v = realloc(ptr_v, new_i);
++  if ( new_v && _uw_hot_cur ) _uw_hot_cur->mem_v = new_v;
++  return new_v;
++}
++#endif
++
+ //  wasm3 calls this at the start of every function compilation.
+ //  the layout of compiled code is a function of the order of compilation
+ //  alone (nothing else allocates from the code arena), so a lazily compiled
+@@ -434,11 +622,16 @@ _uw_compile_hook(IM3Function fun_u, uint32_t idx_h)
+   if ( sat_u->orn_h == sat_u->orc_h )
+   {
+     c3_h  new_h = sat_u->orc_h ? (sat_u->orc_h * 2) : 256;
+-    c3_h* new_u = u3a_malloc((c3_z)new_h * sizeof(c3_h));
++    c3_h* new_u = sat_u->hot_v ? malloc((size_t)new_h * sizeof(c3_h))
++                               : u3a_malloc((c3_z)new_h * sizeof(c3_h));
++    if ( !new_u )
++    {
++      u3m_bail(c3__meme);
++    }
+     if ( sat_u->orn_h )
+     {
+       memcpy(new_u, sat_u->ord_h, (c3_z)sat_u->orn_h * sizeof(c3_h));
+-      u3a_free(sat_u->ord_h);
++      if ( sat_u->hot_v ) { free(sat_u->ord_h); } else { u3a_free(sat_u->ord_h); }
+     }
+     sat_u->ord_h = new_u;
+     sat_u->orc_h = new_h;
+@@ -451,7 +644,7 @@ _uw_order_free(lia_state* sat_u)
+ {
+   if ( sat_u->orc_h )
+   {
+-    u3a_free(sat_u->ord_h);
++    if ( sat_u->hot_v ) { free(sat_u->ord_h); } else { u3a_free(sat_u->ord_h); }
+   }
+   sat_u->ord_h = NULL;
+   sat_u->orn_h = sat_u->orc_h = 0;
+@@ -485,6 +678,10 @@ _calloc_code(size_t num_i, size_t len_i)
+   
+   if (nex_y >= CodeArena->end_y)
+   {
++    if ( CodeArena->hot_t )
++    { // a live instance's code never moves and never spills
++      u3m_bail(c3__fail);
++    }
+     if (!CodeArena->laz_t)
+     { // OOM, jump out to increase the arena size and try again
+       _longjmp(*CodeArena->esc_u, c3__code);
+@@ -2049,13 +2246,18 @@ _find_state(u3_noun seed, c3_t* ork_t)
+ // hint, seed RETAINED; get (a result of _find_state) TRANSFERRED
+ // on success allocates sat_u->wasm_module->runtime->memory.mallocated
+ // and initializes the arenas. siz_h is the size to give a lazy code arena,
+-// or 0 for the default
++// or 0 for the default.
++// hot_u, if not NULL, is the live instance sat_u belongs to: with liv_t it
++// already holds this very state and only the nouns are read; without, the
++// state is built in it (heap buffers) in place of loom arenas.
+ static c3_t
+ _get_state(u3_noun hint,
+            u3_noun seed,
+            lia_state* sat_u,
+            c3_h siz_h,
+-           u3_weak get)
++           u3_weak get,
++           uw_hot* hot_u,
++           c3_t liv_t)
+ {
+   //  inside +mice the cache is handed to hoon as one map keyed by seed, so
+   //  states are kept there in the one form every runtime shares: no lazy
+@@ -2135,7 +2337,46 @@ _get_state(u3_noun hint,
+       ? stack_offset
+       : u3m_bail(c3__fail);
+     
+-    _uw_arena_init_size(BoxArena, box_len_h);
++#if UW_HOT
++    if ( liv_t )
++    {
++      //  the instance is alive and is this state: only the nouns are needed
++      //
++      IM3Runtime       run_u = sat_u->wasm_module->runtime;
++      M3MemoryHeader*  mem_u = run_u->memory.mallocated;
++      if (  (box_len_h != hot_u->box_h)
++         || (run_off_h != (c3_h)((c3_y*)run_u - hot_u->box_y))
++         || (len_buf_h != mem_u->length) )
++      {
++        return u3m_bail(c3__fail);
++      }
++      sat_u->yil_previous = u3k(yil_previous);
++      sat_u->queue = u3k(queue);
++      sat_u->lia_shop = u3k(lia_shop);
++      sat_u->acc = u3k(acc);
++      sat_u->arrow_yil = u3_none;
++      sat_u->susp_list = u3k(susp_list);
++      u3z(get);
++      return 1;
++    }
++    if ( hot_u )
++    {
++      hot_u->box_y = malloc(box_len_h ? box_len_h : 1);
++      hot_u->cod_y = mmap(NULL, UW_HOT_CODE, PROT_READ | PROT_WRITE,
++                          MAP_PRIVATE | MAP_ANON, -1, 0);
++      if ( MAP_FAILED == (void*)hot_u->cod_y ) hot_u->cod_y = NULL;
++      if ( !hot_u->box_y || !hot_u->cod_y )
++      {
++        return u3m_bail(c3__meme);
++      }
++      hot_u->box_h = box_len_h;
++      _uw_arena_init_heap(BoxArena, hot_u->box_y, box_len_h);
++    }
++    else
++#endif
++    {
++      _uw_arena_init_size(BoxArena, box_len_h);
++    }
+     u3r_bytes(pad_h, box_len_h, BoxArena->buf_y, q_box_buffer);
+     M3Result result;
+     IM3Runtime wasm3_runtime = (IM3Runtime)(BoxArena->buf_y + run_off_h);
+@@ -2155,6 +2396,15 @@ _get_state(u3_noun hint,
+     sat_u->rec_t = 0;
+     sat_u->ord_h = NULL;
+     sat_u->orn_h = sat_u->orc_h = 0;
++#if UW_HOT
++    if ( hot_u )
++    {
++      //  one fixed place for all the code this instance will ever compile
++      //
++      _uw_arena_init_heap(CodeArena, hot_u->cod_y, UW_HOT_CODE);
++    }
++    else
++#endif
+     if (laz_t)
+     {
+       //  the code to rebuild must fit without spilling: it is contiguous
+@@ -2257,7 +2507,7 @@ _get_state(u3_noun hint,
+           _uw_order_free(sat_u);
+           _uw_arena_free(CodeArena);
+           _uw_arena_free(BoxArena);
+-          return _get_state(hint, seed, sat_u, big_h * 2, get);
++          return _get_state(hint, seed, sat_u, big_h * 2, get, NULL, 0);
+         }
+         else if (jmp_i == c3__code)
+         {
+@@ -2293,6 +2543,16 @@ _get_state(u3_noun hint,
+       //
+       CodeArena->laz_t = 1;
+     }
++#if UW_HOT
++    if ( hot_u )
++    {
++      hot_u->fun_v = malloc((size_t)(wasm3_module->numFunctions + 1) * 2 * sizeof(void*));
++      if ( !hot_u->fun_v )
++      {
++        return u3m_bail(c3__meme);
++      }
++    }
++#endif
+ 
+     {
+       sat_u->yil_previous = u3k(yil_previous);
+@@ -2305,7 +2565,22 @@ _get_state(u3_noun hint,
+       // sat_u->resolution same
+       sat_u->arrow_yil = u3_none;
+       sat_u->susp_list = u3k(susp_list);
+-      M3MemoryHeader* mem = u3a_malloc(len_buf_h + sizeof(M3MemoryHeader));
++      M3MemoryHeader* mem;
++#if UW_HOT
++      if ( hot_u )
++      {
++        mem = malloc((size_t)len_buf_h + sizeof(M3MemoryHeader));
++        if ( !mem )
++        {
++          return u3m_bail(c3__meme);
++        }
++        hot_u->mem_v = mem;
++      }
++      else
++#endif
++      {
++        mem = u3a_malloc(len_buf_h + sizeof(M3MemoryHeader));
++      }
+       mem->runtime = wasm3_runtime;
+       mem->maxStack = BoxArena->buf_y + stk_off_h;
+       mem->length = len_buf_h;
+@@ -2334,7 +2609,16 @@ _apply_diff(u3_noun input_tag, u3_noun p_input, lia_state* sat_u)
+   {
+     m3_SetTransientAllocators(_calloc_bail, _free_bail, _realloc_bail);
+   }
+-  m3_SetMemoryAllocators(u3a_calloc, u3a_free, u3a_realloc);
++#if UW_HOT
++  if ( sat_u->hot_v )
++  {
++    m3_SetMemoryAllocators(_uw_hot_calloc, _uw_hot_mfree, _uw_hot_realloc);
++  }
++  else
++#endif
++  {
++    m3_SetMemoryAllocators(u3a_calloc, u3a_free, u3a_realloc);
++  }
+ 
+   if (input_tag == c3y)
+   {
+@@ -2467,6 +2751,16 @@ _move_state(
+     {
+       u3z(u3z_save_m(u3z_memo_keep, uw_ord_m, seed_old, u3_nul));
+     }
++#if UW_HOT
++    if ( sat_u->hot_v )
++    {
++      //  nothing was saved, so there is nothing this instance is the live
++      //  form of
++      //
++      _uw_hot_free((uw_hot*)sat_u->hot_v);
++      return;
++    }
++#endif
+     IM3Runtime run_u = sat_u->wasm_module->runtime;
+     M3MemoryHeader* mem_u = run_u->memory.mallocated;
+     u3a_free(mem_u);
+@@ -2493,7 +2787,11 @@ _move_state(
+   u3_atom q_buf = u3i_bytes(_uw_trim((c3_y*)(mem_u + 1), len_buf_w),
+                             (c3_y*)(mem_u + 1));
+ 
+-  u3a_free(mem_u);
++  uw_hot* hot_u = sat_u->hot_v;
++  if ( !hot_u )
++  {
++    u3a_free(mem_u);
++  }
+ 
+   //  suspended with lazily compiled code: save what it takes to rebuild it
+   //
+@@ -2509,7 +2807,34 @@ _move_state(
+                u3i_bytes((c3_w)sat_u->orn_h * 4, (c3_y*)sat_u->ord_h),
+                (c3_h)use_d);
+   }
+-  _uw_order_free(sat_u);
++
++#if UW_HOT
++  //  a live instance stays as it is: its image is copied out, not handed
++  //  over. storing the image turns its pointers into offsets and drops the
++  //  ones into code and memory, so remember those, store, copy, and put
++  //  everything back.
++  //
++  IM3Module       mod_u = sat_u->wasm_module;
++  IM3Environment  env_u = run_u->environment;
++  M3Function*     fun_u = mod_u->functions;
++  c3_w            fun_w = mod_u->numFunctions;
++  IM3CodePage     pop_u = run_u->pagesOpen;
++  IM3CodePage     pfu_u = run_u->pagesFull;
++  IM3CodePage     prl_u = env_u->pagesReleased;
++  void*           usr_v = run_u->userdata;
++  if ( hot_u )
++  {
++    for (c3_w i = 0; i < fun_w; i++)
++    {
++      hot_u->fun_v[2 * i]     = (void*)fun_u[i].compiled;
++      hot_u->fun_v[2 * i + 1] = (void*)fun_u[i].constants;
++    }
++  }
++  else
++#endif
++  {
++    _uw_order_free(sat_u);
++  }
+ 
+   m3_RewritePointersRuntime(run_u, BoxArena->buf_y, 1 /*is_store*/);
+   c3_h run_off_h = (c3_y*)run_u - BoxArena->buf_y;
+@@ -2518,7 +2843,10 @@ _move_state(
+     u3m_bail(c3__fail);
+   }
+   
+-  _uw_arena_free(CodeArena);
++  if ( !hot_u )
++  {
++    _uw_arena_free(CodeArena);
++  }
+ 
+   //  a freshly instantiated arena has headroom it will never use again:
+   //  nothing allocates from it once the state is loaded back. record only
+@@ -2534,9 +2862,49 @@ _move_state(
+   }
+ 
+   c3_y pad_y = BoxArena->pad_y;
++  u3_atom q_box;
+ 
+-  u3_atom q_box = u3i_slab_mint(&BoxArena->sab_u);
+-  BoxArena->ini_t = 0;
++#if UW_HOT
++  if ( hot_u )
++  {
++    //  the image, then the id that ties this saved state to the instance
++    //
++    u3i_slab sab_u;
++    u3i_slab_init(&sab_u, 3, (c3_d)box_len_h + 16);
++    memcpy(sab_u.buf_y, BoxArena->buf_y, box_len_h);
++    if ( !_uw_hot_non_d )
++    {
++      c3_h rad_h[16];   //  c3_rand() fills 512 bits
++      c3_rand(rad_h);
++      _uw_hot_non_d = ((c3_d)rad_h[0] << 32) | rad_h[1] | ((c3_d)1 << 63);
++    }
++    hot_u->idh_d = _uw_hot_non_d;
++    hot_u->idl_d = ++_uw_hot_seq_d;
++    memcpy(sab_u.buf_y + box_len_h,     &hot_u->idl_d, 8);
++    memcpy(sab_u.buf_y + box_len_h + 8, &hot_u->idh_d, 8);
++    q_box = u3i_slab_mint(&sab_u);
++    pad_y = 0;
++
++    run_u->base = BoxArena->buf_y;
++    run_u->base_transient = CodeArena->buf_y;
++    m3_RewritePointersRuntime(run_u, BoxArena->buf_y, 0 /*is_store*/);
++    for (c3_w i = 0; i < fun_w; i++)
++    {
++      fun_u[i].compiled  = (pc_t)hot_u->fun_v[2 * i];
++      fun_u[i].constants = hot_u->fun_v[2 * i + 1];
++    }
++    run_u->pagesOpen = pop_u;
++    run_u->pagesFull = pfu_u;
++    env_u->pagesReleased = prl_u;
++    run_u->userdata = usr_v;
++    run_u->memory.mallocated = mem_u;
++  }
++  else
++#endif
++  {
++    q_box = u3i_slab_mint(&BoxArena->sab_u);
++    BoxArena->ini_t = 0;
++  }
+ 
+   u3_noun stash = uw_octo(
+     u3k(yil),
+@@ -2771,16 +3139,30 @@ u3we_lia_run_v1(u3_noun cor)
+   }
+ 
+ 
+-  lia_state sat;
++  //  the state of this call lives on our stack, or in a live instance
++  //
++  lia_state  sat_s;
++  lia_state* sat_p = &sat_s;
++# define sat (*sat_p)
+   sat.rec_t = 0;
+   sat.ord_h = NULL;
+   sat.orn_h = sat.orc_h = 0;
+   sat.ork_t = 0;
+   sat.cas_t = !!(u3R->how.fag_w & u3a_flag_cash);
++  sat.hot_v = NULL;
+ 
+   BoxArena = &sat.box_arena;
+   CodeArena = &sat.code_arena;
+ 
++  //  live instance, if this call runs on one. while it does, a bail must
++  //  not leave it behind half changed: catch it here, drop the instance,
++  //  and send the bail on its way.
++  //
++  uw_hot* volatile  hot_u = NULL;
++  uw_hot*           hot_prev_u = NULL;
++  __typeof__(u3R->esc)  hot_esc_u;
++  u3_noun           hot_why;
++
+   u3_noun yil;
+   if (!omit_t)
+   {
+@@ -2795,9 +3177,95 @@ u3we_lia_run_v1(u3_noun cor)
+     //  same seed (from an import) may replace it in the cache with a
+     //  tombstone, and the redo below must load the same state again
+     //
+-    u3_weak sav = _find_state(seed, &sat.ork_t);
++    c3_t    ork_t = 0;
++    c3_t    liv_t = 0;
++    u3_weak sav = _find_state(seed, &ork_t);
++    sat.ork_t = ork_t;
++
++#if UW_HOT
++    hot_prev_u = _uw_hot_cur;
++    if (  !sat.cas_t && !oust_t
++       && (u3_none != sav) && (c3y == u3du(sav)) )
++    {
++      u3_noun p_box, q_box, pad_box, p_mem;
++      if (  (c3y == u3r_mean(sav, {56, &p_box}, {57, &q_box}, {29, &pad_box},
++                                  {120, &p_mem}))
++         && (c3y == u3a_is_cat(p_box)) && (c3y == u3a_is_cat(pad_box))
++         && (c3y == u3ud(q_box))
++         && (c3y == u3a_is_cat(p_mem)) && ((c3_d)p_mem <= UW_HOT_MEM) )
++      {
++        c3_d id_d[2] = {0, 0};
++        u3r_bytes(pad_box + p_box, 16, (c3_y*)id_d, q_box);
++        uw_hot* got_u = _uw_hot_find(id_d[1], id_d[0]);
++        if ( got_u )
++        {
++          liv_t = 1;
++        }
++        else
++        {
++          got_u = _uw_hot_take(&yil, (c3_d)p_box + (c3_d)p_mem);
++          if ( got_u )
++          {
++            memset(&got_u->sat_u, 0, sizeof(lia_state));
++          }
++        }
++        if ( got_u )
++        {
++          got_u->sat_y = 2;
++          got_u->own_v = &yil;
++          got_u->idh_d = got_u->idl_d = 0;
++          got_u->use_d = ++_uw_hot_seq_d;
++          sat_p = &got_u->sat_u;
++          sat.hot_v = got_u;
++          sat.is_stateful = 1;
++          sat.ork_t = ork_t;
++          sat.cas_t = 0;
++          BoxArena = &sat.box_arena;
++          CodeArena = &sat.code_arena;
++          _uw_hot_cur = got_u;
++          memcpy(&hot_esc_u, &u3R->esc, sizeof(hot_esc_u));
++          hot_u = got_u;
++        }
++      }
++    }
++    if ( hot_u )
++    {
++      if ( uw_trap(hot_why) )
++      {
++        //  armed
++      }
++      else
++      {
++        //  a bail came through while the instance was in use
++        //
++        memcpy(&u3R->esc, &hot_esc_u, sizeof(hot_esc_u));
++        _uw_hot_cur = hot_prev_u;
++        if ( hot_u ) _uw_hot_free(hot_u);
++        uw_escape(hot_why);
++      }
++    }
++#endif
++
+     c3_t    hit_t = _get_state(hint, seed, &sat, siz_h,
+-                               (u3_none == sav) ? u3_none : u3k(sav));
++                               (u3_none == sav) ? u3_none : u3k(sav),
++                               hot_u, liv_t);
++#if UW_HOT
++    if ( !hit_t && hot_u )
++    {
++      //  the saved state would not load: back to the stack, and recompute
++      //
++      uw_hot* bad_u = hot_u;
++      hot_u = NULL;
++      memcpy(&u3R->esc, &hot_esc_u, sizeof(hot_esc_u));
++      _uw_hot_cur = hot_prev_u;
++      _uw_hot_free(bad_u);
++      sat_p = &sat_s;
++      sat.hot_v = NULL;
++      sat.ork_t = ork_t;
++      BoxArena = &sat.box_arena;
++      CodeArena = &sat.code_arena;
++    }
++#endif
+     if ( hit_t )
+     {
+       sat.map = u3t(u3at(seed_import, seed));
+@@ -2805,7 +3273,7 @@ u3we_lia_run_v1(u3_noun cor)
+       sat.resolution = u3_none;
+       yil = _apply_diff(input_tag, p_input, &sat);
+ 
+-      if ( sat.laz_t )
++      if ( sat.laz_t && !sat.hot_v )
+       {
+         //  remember how much room this module's code took. let the size
+         //  come back down after lighter calls: a call that needs more just
+@@ -2839,7 +3307,7 @@ u3we_lia_run_v1(u3_noun cor)
+         _uw_arena_free(CodeArena);
+         _uw_arena_free(BoxArena);
+ 
+-        if ( !_get_state(hint, seed, &sat, siz_h, u3k(sav)) )
++        if ( !_get_state(hint, seed, &sat, siz_h, u3k(sav), NULL, 0) )
+         {
+           return u3m_bail(c3__fail);
+         }
+@@ -3038,6 +3506,17 @@ u3we_lia_run_v1(u3_noun cor)
+       u3z(sav);
+     }
+     _move_state(&sat, seed, seed_new, hint, yil);
++#if UW_HOT
++    if ( hot_u )
++    {
++      //  saved: stand down the trap, and the instance is ready for the
++      //  call that asks for the state just saved (unless it was dropped)
++      //
++      memcpy(&u3R->esc, &hot_esc_u, sizeof(hot_esc_u));
++      _uw_hot_cur = hot_prev_u;
++      if ( 2 == hot_u->sat_y ) hot_u->sat_y = 1;
++    }
++#endif
+   }
+   else
+   {
+@@ -3226,6 +3705,7 @@ u3we_lia_run_v1(u3_noun cor)
+   #endif
+ 
+   return pro;
++# undef sat
+ 
+ #endif // URWASM_STATEFUL
+ }
+-- 
+2.52.0
+
