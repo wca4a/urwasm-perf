@@ -303,3 +303,34 @@ all caught; ship replay 905 of 905 replies identical to Node on original and pat
 "Hand 1 checked: the deal was fair" with all six lines passing.
 Per move on the ship (noisy machine): patched 3.5 ms, original 6.8 ms; deal patched 6.6 ms, original 25 ms.
 Does not hide the cards from the ship operator, and does not stop a player colluding with the ship from grinding their number.
+
+## Where the per-step cost comes from (2026-11-26)
+
+Profiled `+steps %notes 30.000 %gent %c4` on the patched runtime with macOS `sample`. Of the time inside the jet, 66% is
+under `uw_slam_check` (running a `;<` continuation), and it is Nock interpretation plus noun allocation and freeing, not wasm.
+
+Two candidate causes, tested separately:
+
+1. The fresh virtualization (`u3n_nock_an`, a new road per continuation). Replaced with `u3n_nock_on` under a test switch:
+   c1 0.184 -> 0.188, c2 0.394 -> 0.399, c4 1.010 -> 0.811, all 1.726 -> 1.667 ms. Small, and it would change behaviour
+   (scries in scripts are blocked today). Not pursued; switch removed.
+2. The Hoon library itself. `bench/monad.hoon` builds script forms without running any wasm:
+
+| what is built | ms each |
+|---|---|
+| empty loop | 0.0006 |
+| `*m-sat` (default lia-state) | 0.014 |
+| `(call 'f' ~)` | 0.014 |
+| `(memread 0 16)` | 0.014 |
+| `(call-1 'f' ~)` | 0.088 |
+| `;<` around `call` | 0.087 |
+| `;<` around `call-1` | 0.16 to 0.23 |
+
+So the cost is in lib/wasm/lia: every `;<` costs about 0.07 ms to build (the forms are gates whose sample defaults are
+bunted each time), and `call-1` hides a second `;<`. It is not a runtime problem and the jet cannot avoid it.
+
+What an app can do today (`+steps ... %lean`): reserve the request buffer once and reuse it, and use `call` in place of
+`call-1`. Same request, same answer: 1.38 -> 1.01 ms per call (27% less), no runtime change.
+
+What the library could do: give the script forms a cheap default sample (compute the lia-state default once per `arrows`
+core, not per form). That changes core layout the jet depends on (context axes), so kernel and runtime would change together.
