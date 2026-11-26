@@ -403,3 +403,21 @@ Codex reviewed the keep-alive commit: two P1, two P2, all addressed (vere `urwas
 Checks after the fixes: upstream tests 48/48; stale-instance test all agree; notes 814, SQL 367, poker 905 identical to Node.
 Forced fallback (test switch giving 64 KB of code room): 2,255 fallbacks taken, same results on all of the above, no bails or
 faults. The fixes themselves are unreviewed.
+
+### Keep-alive: second review round (2026-11-26)
+
+Second Codex pass on `urwasm-hot`: one P1 and three P2, all addressed; the commit is now a5039eb's successor (one commit, `patches/0004-*`).
+
+- The jet no longer calls `c3_rand` (defined in pkg/vere, so noun-only targets would not link). The per-process id comes from
+  libent, which libnoun already links.
+- The mid-call "outgrew its room, run again the ordinary way" path is gone, and with it the leaks Codex pointed out. Instead each
+  live instance reserves address space for all the wasm memory a module can have (4 GiB) and all the code an arena can describe
+  (just under 4 GiB). These are reservations, not memory in use.
+- What is kept is limited by use: an instance whose memory passes 256 MB is dropped after its call, and the 512 MB total now
+  counts compiled code as well as structs and memory.
+- If the per-function scratch table cannot be allocated, the state is loaded the ordinary way instead of failing.
+
+Checks: upstream tests 48/48; stale-instance test identical to keep-alive off; notes 814, SQL 367, poker 905 identical to Node;
+rustmod sequence identical to Node, including one that grows memory by 300 MB mid-run (so the instance is dropped and later
+calls load from the saved state). No bails or faults.
+On a quieter machine: notes 814 requests in 1.01 s (original runtime 5.04 s), SQL 367 in 3.69 s (9.01 s), poker 905 in 2.23 s.
