@@ -1,4 +1,4 @@
-From 2b5c4196fb5794c5beecb50fcc3c5b6c89e38243 Mon Sep 17 00:00:00 2001
+From a5039eb2156bffbda95cd317dda0edf5678130ae Mon Sep 17 00:00:00 2001
 From: william arzt <bill@tlon.io>
 Date: Thu, 26 Nov 2026 14:38:54 -0500
 Subject: [PATCH] urwasm: keep instances alive between calls
@@ -24,11 +24,11 @@ the bytes it reads).
 
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 ---
- pkg/noun/jets/e/urwasm.c | 518 +++++++++++++++++++++++++++++++++++++--
- 1 file changed, 499 insertions(+), 19 deletions(-)
+ pkg/noun/jets/e/urwasm.c | 636 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 617 insertions(+), 19 deletions(-)
 
 diff --git a/pkg/noun/jets/e/urwasm.c b/pkg/noun/jets/e/urwasm.c
-index 4682a49b67..143c7f0d85 100644
+index 4682a49b67..ac9c7e22f3 100644
 --- a/pkg/noun/jets/e/urwasm.c
 +++ b/pkg/noun/jets/e/urwasm.c
 @@ -107,6 +107,7 @@ typedef struct {
@@ -89,7 +89,7 @@ index 4682a49b67..143c7f0d85 100644
    u3i_slab_free(&ren_u->sab_u);
    for (c3_w i = 0; i < ren_u->chk_w; i++)
    {
-@@ -415,6 +438,171 @@ _uw_arena_free(uw_arena* ren_u)
+@@ -415,6 +438,231 @@ _uw_arena_free(uw_arena* ren_u)
    ren_u->ini_t = 0;
  }
  
@@ -116,7 +116,8 @@ index 4682a49b67..143c7f0d85 100644
 +#  include <sys/mman.h>
 +#  define UW_HOT        8                     //  instances kept
 +#  define UW_HOT_CODE   ((c3_h)1 << 28)       //  code room each, reserved not used
-+#  define UW_HOT_MEM    ((c3_d)1 << 28)       //  largest wasm memory kept live
++#  define UW_HOT_MEM    ((c3_d)1 << 28)       //  wasm memory room each, likewise
++#  define UW_HOT_MAP    (UW_HOT_MEM + (1 << 16))  //  that, and its header
 +#  define UW_HOT_ALL    ((c3_d)1 << 29)       //  structs and memory kept, in total
 +#else
 +#  define UW_HOT        0
@@ -140,12 +141,16 @@ index 4682a49b67..143c7f0d85 100644
 +  c3_y*      box_y;         //  struct arena (malloc)
 +  c3_h       box_h;
 +  c3_y*      cod_y;         //  code arena (mmap)
-+  void*      mem_v;         //  wasm memory block (malloc), kept current
++  void*      mem_v;         //  wasm memory, header first (mmap). never moves
++  c3_t       ful_t;         //  code or memory outgrew its room during a call
 +  void**     fun_v;         //  scratch: per-function pointers across a save
 +  lia_state  sat_u;
 +} uw_hot;
 +
 +#if UW_HOT
++//  modules seen to outgrow a live instance in this process: not tried again.
++//  a performance hint only, any value here is safe.
++static c3_w     _uw_hot_not_w[64];
 +static uw_hot   _uw_hot_u[UW_HOT];
 +static uw_hot*  _uw_hot_cur;    //  instance whose wasm memory is being served
 +static c3_d     _uw_hot_seq_d;  //  ids and use stamps
@@ -156,8 +161,9 @@ index 4682a49b67..143c7f0d85 100644
 +{
 +  if ( hot_u->box_y ) free(hot_u->box_y);
 +  if ( hot_u->cod_y ) munmap(hot_u->cod_y, UW_HOT_CODE);
-+  if ( hot_u->mem_v ) free(hot_u->mem_v);
++  if ( hot_u->mem_v ) munmap(hot_u->mem_v, UW_HOT_MAP);
 +  if ( hot_u->fun_v ) free(hot_u->fun_v);
++  hot_u->ful_t = 0;
 +  if ( hot_u->sat_u.orc_h ) free(hot_u->sat_u.ord_h);
 +  hot_u->box_y = hot_u->cod_y = NULL;
 +  hot_u->mem_v = NULL;
@@ -232,36 +238,90 @@ index 4682a49b67..143c7f0d85 100644
 +  }
 +}
 +
-+//  wasm memory of the live instance: plain heap, and we track the block
++//  drop the least recently used ready instances until what is kept fits
++static void
++_uw_hot_trim(void)
++{
++  while ( 1 )
++  {
++    uw_hot* old_u = NULL;
++    c3_d    all_d = 0;
++    for (c3_w i = 0; i < UW_HOT; i++)
++    {
++      uw_hot* hot_u = &_uw_hot_u[i];
++      if ( 0 == hot_u->sat_y ) continue;
++      all_d += _uw_hot_size(hot_u);
++      if ( (1 == hot_u->sat_y) && (!old_u || (hot_u->use_d < old_u->use_d)) )
++      {
++        old_u = hot_u;
++      }
++    }
++    if ( (all_d <= UW_HOT_ALL) || !old_u ) return;
++    _uw_hot_free(old_u);
++  }
++}
++
++//  the buffers of a new instance with a struct image of box_h bytes. each
++//  is one fixed piece for the life of the instance, so no pointer into
++//  them ever goes stale. on failure the slot is left empty.
++static c3_t
++_uw_hot_room(uw_hot* hot_u, c3_h box_h)
++{
++  hot_u->box_y = malloc(box_h ? box_h : 1);
++  hot_u->box_h = box_h;
++  hot_u->cod_y = mmap(NULL, UW_HOT_CODE, PROT_READ | PROT_WRITE,
++                      MAP_PRIVATE | MAP_ANON, -1, 0);
++  hot_u->mem_v = mmap(NULL, UW_HOT_MAP, PROT_READ | PROT_WRITE,
++                      MAP_PRIVATE | MAP_ANON, -1, 0);
++  if ( MAP_FAILED == (void*)hot_u->cod_y ) hot_u->cod_y = NULL;
++  if ( MAP_FAILED == hot_u->mem_v ) hot_u->mem_v = NULL;
++  if ( !hot_u->box_y || !hot_u->cod_y || !hot_u->mem_v )
++  {
++    _uw_hot_free(hot_u);
++    return 0;
++  }
++  return 1;
++}
++
++//  the live instance has outgrown its room: the call cannot go on here.
++//  the jet catches this, drops the instance and runs the call again the
++//  ordinary way, where there is no such limit.
++static void
++_uw_hot_full(void)
++{
++  if ( _uw_hot_cur ) _uw_hot_cur->ful_t = 1;
++  u3m_bail(c3__exit);
++}
++
++//  wasm memory of the live instance: it grows in place
 +//
 +static void*
 +_uw_hot_calloc(size_t num_i, size_t len_i)
 +{
-+  void* ptr_v = calloc(num_i, len_i);
-+  if ( ptr_v && _uw_hot_cur ) _uw_hot_cur->mem_v = ptr_v;
-+  return ptr_v;
++  size_t byt_i = num_i * len_i;
++  if ( !_uw_hot_cur || (byt_i > UW_HOT_MAP) ) { _uw_hot_full(); return NULL; }
++  memset(_uw_hot_cur->mem_v, 0, byt_i);
++  return _uw_hot_cur->mem_v;
 +}
 +
 +static void
 +_uw_hot_mfree(void* ptr_v)
 +{
-+  if ( _uw_hot_cur && (_uw_hot_cur->mem_v == ptr_v) ) _uw_hot_cur->mem_v = NULL;
-+  free(ptr_v);
 +}
 +
 +static void*
 +_uw_hot_realloc(void* ptr_v, size_t old_i, size_t new_i)
 +{
-+  void* new_v = realloc(ptr_v, new_i);
-+  if ( new_v && _uw_hot_cur ) _uw_hot_cur->mem_v = new_v;
-+  return new_v;
++  if ( !_uw_hot_cur || (new_i > UW_HOT_MAP) ) { _uw_hot_full(); return NULL; }
++  if ( !ptr_v ) memset(_uw_hot_cur->mem_v, 0, new_i);
++  return _uw_hot_cur->mem_v;
 +}
 +#endif
 +
  //  wasm3 calls this at the start of every function compilation.
  //  the layout of compiled code is a function of the order of compilation
  //  alone (nothing else allocates from the code arena), so a lazily compiled
-@@ -434,11 +622,16 @@ _uw_compile_hook(IM3Function fun_u, uint32_t idx_h)
+@@ -434,11 +682,16 @@ _uw_compile_hook(IM3Function fun_u, uint32_t idx_h)
    if ( sat_u->orn_h == sat_u->orc_h )
    {
      c3_h  new_h = sat_u->orc_h ? (sat_u->orc_h * 2) : 256;
@@ -280,7 +340,7 @@ index 4682a49b67..143c7f0d85 100644
      }
      sat_u->ord_h = new_u;
      sat_u->orc_h = new_h;
-@@ -451,7 +644,7 @@ _uw_order_free(lia_state* sat_u)
+@@ -451,7 +704,7 @@ _uw_order_free(lia_state* sat_u)
  {
    if ( sat_u->orc_h )
    {
@@ -289,18 +349,20 @@ index 4682a49b67..143c7f0d85 100644
    }
    sat_u->ord_h = NULL;
    sat_u->orn_h = sat_u->orc_h = 0;
-@@ -485,6 +678,10 @@ _calloc_code(size_t num_i, size_t len_i)
+@@ -485,6 +738,12 @@ _calloc_code(size_t num_i, size_t len_i)
    
    if (nex_y >= CodeArena->end_y)
    {
++#if UW_HOT
 +    if ( CodeArena->hot_t )
 +    { // a live instance's code never moves and never spills
-+      u3m_bail(c3__fail);
++      _uw_hot_full();
 +    }
++#endif
      if (!CodeArena->laz_t)
      { // OOM, jump out to increase the arena size and try again
        _longjmp(*CodeArena->esc_u, c3__code);
-@@ -2049,13 +2246,18 @@ _find_state(u3_noun seed, c3_t* ork_t)
+@@ -2049,13 +2308,18 @@ _find_state(u3_noun seed, c3_t* ork_t)
  // hint, seed RETAINED; get (a result of _find_state) TRANSFERRED
  // on success allocates sat_u->wasm_module->runtime->memory.mallocated
  // and initializes the arenas. siz_h is the size to give a lazy code arena,
@@ -321,7 +383,7 @@ index 4682a49b67..143c7f0d85 100644
  {
    //  inside +mice the cache is handed to hoon as one map keyed by seed, so
    //  states are kept there in the one form every runtime shares: no lazy
-@@ -2135,7 +2337,46 @@ _get_state(u3_noun hint,
+@@ -2135,7 +2399,41 @@ _get_state(u3_noun hint,
        ? stack_offset
        : u3m_bail(c3__fail);
      
@@ -350,15 +412,10 @@ index 4682a49b67..143c7f0d85 100644
 +    }
 +    if ( hot_u )
 +    {
-+      hot_u->box_y = malloc(box_len_h ? box_len_h : 1);
-+      hot_u->cod_y = mmap(NULL, UW_HOT_CODE, PROT_READ | PROT_WRITE,
-+                          MAP_PRIVATE | MAP_ANON, -1, 0);
-+      if ( MAP_FAILED == (void*)hot_u->cod_y ) hot_u->cod_y = NULL;
-+      if ( !hot_u->box_y || !hot_u->cod_y )
++      if ( box_len_h != hot_u->box_h )
 +      {
-+        return u3m_bail(c3__meme);
++        return u3m_bail(c3__fail);
 +      }
-+      hot_u->box_h = box_len_h;
 +      _uw_arena_init_heap(BoxArena, hot_u->box_y, box_len_h);
 +    }
 +    else
@@ -369,7 +426,7 @@ index 4682a49b67..143c7f0d85 100644
      u3r_bytes(pad_h, box_len_h, BoxArena->buf_y, q_box_buffer);
      M3Result result;
      IM3Runtime wasm3_runtime = (IM3Runtime)(BoxArena->buf_y + run_off_h);
-@@ -2155,6 +2396,15 @@ _get_state(u3_noun hint,
+@@ -2155,6 +2453,15 @@ _get_state(u3_noun hint,
      sat_u->rec_t = 0;
      sat_u->ord_h = NULL;
      sat_u->orn_h = sat_u->orc_h = 0;
@@ -385,7 +442,7 @@ index 4682a49b67..143c7f0d85 100644
      if (laz_t)
      {
        //  the code to rebuild must fit without spilling: it is contiguous
-@@ -2257,7 +2507,7 @@ _get_state(u3_noun hint,
+@@ -2257,7 +2564,7 @@ _get_state(u3_noun hint,
            _uw_order_free(sat_u);
            _uw_arena_free(CodeArena);
            _uw_arena_free(BoxArena);
@@ -394,7 +451,7 @@ index 4682a49b67..143c7f0d85 100644
          }
          else if (jmp_i == c3__code)
          {
-@@ -2293,6 +2543,16 @@ _get_state(u3_noun hint,
+@@ -2293,6 +2600,16 @@ _get_state(u3_noun hint,
        //
        CodeArena->laz_t = 1;
      }
@@ -411,7 +468,7 @@ index 4682a49b67..143c7f0d85 100644
  
      {
        sat_u->yil_previous = u3k(yil_previous);
-@@ -2305,7 +2565,22 @@ _get_state(u3_noun hint,
+@@ -2305,7 +2622,21 @@ _get_state(u3_noun hint,
        // sat_u->resolution same
        sat_u->arrow_yil = u3_none;
        sat_u->susp_list = u3k(susp_list);
@@ -420,12 +477,11 @@ index 4682a49b67..143c7f0d85 100644
 +#if UW_HOT
 +      if ( hot_u )
 +      {
-+        mem = malloc((size_t)len_buf_h + sizeof(M3MemoryHeader));
-+        if ( !mem )
++        if ( (c3_d)len_buf_h + sizeof(M3MemoryHeader) > UW_HOT_MAP )
 +        {
-+          return u3m_bail(c3__meme);
++          return u3m_bail(c3__fail);
 +        }
-+        hot_u->mem_v = mem;
++        mem = hot_u->mem_v;
 +      }
 +      else
 +#endif
@@ -435,7 +491,7 @@ index 4682a49b67..143c7f0d85 100644
        mem->runtime = wasm3_runtime;
        mem->maxStack = BoxArena->buf_y + stk_off_h;
        mem->length = len_buf_h;
-@@ -2334,7 +2609,16 @@ _apply_diff(u3_noun input_tag, u3_noun p_input, lia_state* sat_u)
+@@ -2334,7 +2665,16 @@ _apply_diff(u3_noun input_tag, u3_noun p_input, lia_state* sat_u)
    {
      m3_SetTransientAllocators(_calloc_bail, _free_bail, _realloc_bail);
    }
@@ -453,7 +509,7 @@ index 4682a49b67..143c7f0d85 100644
  
    if (input_tag == c3y)
    {
-@@ -2467,6 +2751,16 @@ _move_state(
+@@ -2467,6 +2807,16 @@ _move_state(
      {
        u3z(u3z_save_m(u3z_memo_keep, uw_ord_m, seed_old, u3_nul));
      }
@@ -470,7 +526,7 @@ index 4682a49b67..143c7f0d85 100644
      IM3Runtime run_u = sat_u->wasm_module->runtime;
      M3MemoryHeader* mem_u = run_u->memory.mallocated;
      u3a_free(mem_u);
-@@ -2493,7 +2787,11 @@ _move_state(
+@@ -2493,7 +2843,11 @@ _move_state(
    u3_atom q_buf = u3i_bytes(_uw_trim((c3_y*)(mem_u + 1), len_buf_w),
                              (c3_y*)(mem_u + 1));
  
@@ -483,7 +539,7 @@ index 4682a49b67..143c7f0d85 100644
  
    //  suspended with lazily compiled code: save what it takes to rebuild it
    //
-@@ -2509,7 +2807,34 @@ _move_state(
+@@ -2509,7 +2863,34 @@ _move_state(
                 u3i_bytes((c3_w)sat_u->orn_h * 4, (c3_y*)sat_u->ord_h),
                 (c3_h)use_d);
    }
@@ -519,7 +575,7 @@ index 4682a49b67..143c7f0d85 100644
  
    m3_RewritePointersRuntime(run_u, BoxArena->buf_y, 1 /*is_store*/);
    c3_h run_off_h = (c3_y*)run_u - BoxArena->buf_y;
-@@ -2518,7 +2843,10 @@ _move_state(
+@@ -2518,7 +2899,10 @@ _move_state(
      u3m_bail(c3__fail);
    }
    
@@ -531,7 +587,7 @@ index 4682a49b67..143c7f0d85 100644
  
    //  a freshly instantiated arena has headroom it will never use again:
    //  nothing allocates from it once the state is loaded back. record only
-@@ -2534,9 +2862,49 @@ _move_state(
+@@ -2534,9 +2918,49 @@ _move_state(
    }
  
    c3_y pad_y = BoxArena->pad_y;
@@ -583,7 +639,7 @@ index 4682a49b67..143c7f0d85 100644
  
    u3_noun stash = uw_octo(
      u3k(yil),
-@@ -2771,16 +3139,30 @@ u3we_lia_run_v1(u3_noun cor)
+@@ -2771,16 +3195,32 @@ u3we_lia_run_v1(u3_noun cor)
    }
  
  
@@ -609,13 +665,15 @@ index 4682a49b67..143c7f0d85 100644
 +  //
 +  uw_hot* volatile  hot_u = NULL;
 +  uw_hot*           hot_prev_u = NULL;
++  volatile c3_t     col_t = 0;   //  no live instance for this call
++  u3_noun           hot_tax = u3_nul;
 +  __typeof__(u3R->esc)  hot_esc_u;
 +  u3_noun           hot_why;
 +
    u3_noun yil;
    if (!omit_t)
    {
-@@ -2795,9 +3177,95 @@ u3we_lia_run_v1(u3_noun cor)
+@@ -2795,9 +3235,152 @@ u3we_lia_run_v1(u3_noun cor)
      //  same seed (from an import) may replace it in the cache with a
      //  tombstone, and the redo below must load the same state again
      //
@@ -627,7 +685,9 @@ index 4682a49b67..143c7f0d85 100644
 +
 +#if UW_HOT
 +    hot_prev_u = _uw_hot_cur;
-+    if (  !sat.cas_t && !oust_t
++  uw_again:
++    if (  !col_t && !sat.cas_t && !oust_t
++       && (_uw_hot_not_w[mug_w & 63] != mug_w)
 +       && (u3_none != sav) && (c3y == u3du(sav)) )
 +    {
 +      u3_noun p_box, q_box, pad_box, p_mem;
@@ -647,6 +707,10 @@ index 4682a49b67..143c7f0d85 100644
 +        else
 +        {
 +          got_u = _uw_hot_take(&yil, (c3_d)p_box + (c3_d)p_mem);
++          if ( got_u && !_uw_hot_room(got_u, (c3_h)p_box) )
++          {
++            got_u = NULL;   //  no room to keep it: run the ordinary way
++          }
 +          if ( got_u )
 +          {
 +            memset(&got_u->sat_u, 0, sizeof(lia_state));
@@ -666,6 +730,7 @@ index 4682a49b67..143c7f0d85 100644
 +          BoxArena = &sat.box_arena;
 +          CodeArena = &sat.code_arena;
 +          _uw_hot_cur = got_u;
++          hot_tax = u3R->bug.tax;
 +          memcpy(&hot_esc_u, &u3R->esc, sizeof(hot_esc_u));
 +          hot_u = got_u;
 +        }
@@ -683,8 +748,58 @@ index 4682a49b67..143c7f0d85 100644
 +        //
 +        memcpy(&u3R->esc, &hot_esc_u, sizeof(hot_esc_u));
 +        _uw_hot_cur = hot_prev_u;
-+        if ( hot_u ) _uw_hot_free(hot_u);
-+        uw_escape(hot_why);
++        c3_t ful_t = 0;
++        if ( hot_u )
++        {
++          uw_hot* bad_u = hot_u;
++          hot_u = NULL;
++          ful_t = bad_u->ful_t;
++          if ( ful_t )
++          {
++            //  it ran out of room, which the ordinary way does not: let go
++            //  of what the abandoned attempt held and run the call again
++            //
++            lia_state* old_u = &bad_u->sat_u;
++            if ( u3_none != old_u->yil_previous ) u3z(old_u->yil_previous);
++            if ( u3_none != old_u->queue )        u3z(old_u->queue);
++            if ( u3_none != old_u->lia_shop )     u3z(old_u->lia_shop);
++            if ( u3_none != old_u->susp_list )    u3z(old_u->susp_list);
++            if ( u3_none != old_u->arrow_yil )    u3z(old_u->arrow_yil);
++            u3z(old_u->acc);
++          }
++          _uw_hot_free(bad_u);
++        }
++        if ( !ful_t )
++        {
++          uw_escape(hot_why);
++        }
++        //  the ball is [%2 trace], and the trace is the road's own: drop the
++        //  ball without it, then wind the trace back to where we came in
++        //
++        {
++          u3_noun cur = u3R->bug.tax;
++          u3k(cur);
++          u3z(hot_why);
++          u3k(hot_tax);
++          u3z(cur);
++          u3R->bug.tax = hot_tax;
++        }
++        _uw_hot_not_w[mug_w & 63] = mug_w;
++        col_t = 1;
++        liv_t = 0;
++        sat_p = &sat_s;
++        sat.rec_t = 0;
++        sat.ord_h = NULL;
++        sat.orn_h = sat.orc_h = 0;
++        sat.ork_t = ork_t;
++        sat.cas_t = 0;
++        sat.hot_v = NULL;
++        sat.is_stateful = 1;
++        sat.laz_t = 0;
++        BoxArena = &sat.box_arena;
++        CodeArena = &sat.code_arena;
++        m3_SetCompileHook(_uw_compile_hook);
++        goto uw_again;
 +      }
 +    }
 +#endif
@@ -713,7 +828,7 @@ index 4682a49b67..143c7f0d85 100644
      if ( hit_t )
      {
        sat.map = u3t(u3at(seed_import, seed));
-@@ -2805,7 +3273,7 @@ u3we_lia_run_v1(u3_noun cor)
+@@ -2805,7 +3388,7 @@ u3we_lia_run_v1(u3_noun cor)
        sat.resolution = u3_none;
        yil = _apply_diff(input_tag, p_input, &sat);
  
@@ -722,7 +837,7 @@ index 4682a49b67..143c7f0d85 100644
        {
          //  remember how much room this module's code took. let the size
          //  come back down after lighter calls: a call that needs more just
-@@ -2839,7 +3307,7 @@ u3we_lia_run_v1(u3_noun cor)
+@@ -2839,7 +3422,7 @@ u3we_lia_run_v1(u3_noun cor)
          _uw_arena_free(CodeArena);
          _uw_arena_free(BoxArena);
  
@@ -731,7 +846,7 @@ index 4682a49b67..143c7f0d85 100644
          {
            return u3m_bail(c3__fail);
          }
-@@ -3038,6 +3506,17 @@ u3we_lia_run_v1(u3_noun cor)
+@@ -3038,6 +3621,20 @@ u3we_lia_run_v1(u3_noun cor)
        u3z(sav);
      }
      _move_state(&sat, seed, seed_new, hint, yil);
@@ -744,12 +859,15 @@ index 4682a49b67..143c7f0d85 100644
 +      memcpy(&u3R->esc, &hot_esc_u, sizeof(hot_esc_u));
 +      _uw_hot_cur = hot_prev_u;
 +      if ( 2 == hot_u->sat_y ) hot_u->sat_y = 1;
++      //  its memory may have grown during the call
++      //
++      _uw_hot_trim();
 +    }
 +#endif
    }
    else
    {
-@@ -3226,6 +3705,7 @@ u3we_lia_run_v1(u3_noun cor)
+@@ -3226,6 +3823,7 @@ u3we_lia_run_v1(u3_noun cor)
    #endif
  
    return pro;

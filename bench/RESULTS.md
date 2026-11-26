@@ -387,3 +387,19 @@ Time per request (median; the machine was busy with an unrelated job, so treat a
 After this the SQL workload is 91% interpreter time: the remaining gap to Node there is wasm3 itself.
 Not tested: the signal-abort reclaim; behaviour under real memory pressure; Windows (keep-alive is compiled out there).
 Not reviewed by anyone else yet.
+
+### Keep-alive: review fixes (2026-11-26)
+
+Codex reviewed the keep-alive commit: two P1, two P2, all addressed (vere `urwasm-hot`, one commit, `patches/0004-*`).
+
+- A live instance's wasm memory is now one fixed mmap reservation (256 MB) that grows in place, like its code. No pointer
+  the slot holds can go stale, so reclaiming a slot abandoned by a signal abort cannot double-free.
+- When a live instance outgrows its code or memory room mid-call, the jet catches it, drops the instance, winds the road's
+  error trace back, and runs the call again the ordinary way (which has no such limit). The module is remembered and not
+  tried live again in this process. Costs one repeated call (imports may run twice) and a small one-off leak in the road.
+- If room for a new live instance cannot be reserved, the call just runs the ordinary way.
+- The total kept is rechecked after every call, since memory can grow during one.
+
+Checks after the fixes: upstream tests 48/48; stale-instance test all agree; notes 814, SQL 367, poker 905 identical to Node.
+Forced fallback (test switch giving 64 KB of code room): 2,255 fallbacks taken, same results on all of the above, no bails or
+faults. The fixes themselves are unreviewed.
