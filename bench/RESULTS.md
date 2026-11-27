@@ -421,3 +421,28 @@ Checks: upstream tests 48/48; stale-instance test identical to keep-alive off; n
 rustmod sequence identical to Node, including one that grows memory by 300 MB mid-run (so the instance is dropped and later
 calls load from the saved state). No bails or faults.
 On a quieter machine: notes 814 requests in 1.01 s (original runtime 5.04 s), SQL 367 in 3.69 s (9.01 s), poker 905 in 2.23 s.
+
+### Keep-alive: third review round (2026-11-27)
+
+Third Codex pass on `urwasm-hot`: one P1 and two P2, all addressed in a second commit on the branch (50612c5, `patches/0005-*`).
+
+- A live instance has room for almost 4 GiB of code, an ordinary load for 1 GiB (`UW_CODE_MAX`). A computation that suspended with
+  more code than an ordinary load can rebuild could be saved and then fail to load once its live instance was dropped. Such a state
+  is now not saved, exactly like one whose code spilled: the next call recomputes from the seed.
+- What an instance holds now includes its per-function scratch table and its compile-order buffer.
+- `_uw_hot_take` drops nothing when the new instance cannot fit beside the instances in use (or alone): it returns NULL first.
+
+Checks on the test build (`urwasm-hot-test`), plain and with `URWASM_BIG=1`, a test-only switch that sends every suspended live
+state down the "too much code" path:
+
+| | plain | `URWASM_BIG=1` |
+|---|---|---|
+| upstream wasm tests | 48/48, same as original | 48/48, same as original |
+| `+hot-test` | all agree, identical to keep-alive off | all agree, identical to keep-alive off |
+| rustmod sequence | matches Node | matches Node |
+| notes, 814 requests | 0 different, 947 ms | 0 different, 962 ms |
+| SQL, 367 requests | 0 different, 3470 ms | 0 different, 42321 ms |
+| poker, 905 requests | 0 different, 2136 ms | 0 different, 2140 ms |
+| forced drops / bails / faults | 0 / 0 / 0 | 22 / 0 / 0 |
+
+The forced run is slow for SQL because each dropped state is recomputed from the seed; it is there to show the answers stay right.

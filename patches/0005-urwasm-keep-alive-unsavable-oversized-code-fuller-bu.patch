@@ -1,0 +1,144 @@
+From 50612c510574cca503e3cddbf4798de2a36681fc Mon Sep 17 00:00:00 2001
+From: william arzt <bill@tlon.io>
+Date: Fri, 27 Nov 2026 05:24:58 -0500
+Subject: [PATCH] urwasm: keep-alive: unsavable oversized code, fuller budget
+
+A live instance has room for more code than an ordinary load can
+rebuild. A computation suspended with more than that is not saved (as
+for one whose code spilled): the next call recomputes from the seed.
+
+Count the per-function scratch table and the compile order in what an
+instance holds. Do not drop instances to make room for one that cannot
+fit beside those in use.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ pkg/noun/jets/e/urwasm.c | 60 ++++++++++++++++++++++++++++++----------
+ 1 file changed, 46 insertions(+), 14 deletions(-)
+
+diff --git a/pkg/noun/jets/e/urwasm.c b/pkg/noun/jets/e/urwasm.c
+index 882e388896..6a43814f95 100644
+--- a/pkg/noun/jets/e/urwasm.c
++++ b/pkg/noun/jets/e/urwasm.c
+@@ -492,6 +492,7 @@ typedef struct {
+   c3_y*      cod_y;         //  code arena (mmap)
+   void*      mem_v;         //  wasm memory, header first (mmap). never moves
+   void**     fun_v;         //  scratch: per-function pointers across a save
++  c3_d       fun_d;         //  its size in bytes
+   lia_state  sat_u;
+ } uw_hot;
+ 
+@@ -512,6 +513,7 @@ _uw_hot_free(uw_hot* hot_u)
+   hot_u->box_y = hot_u->cod_y = NULL;
+   hot_u->mem_v = NULL;
+   hot_u->fun_v = NULL;
++  hot_u->fun_d = 0;
+   hot_u->sat_u.ord_h = NULL;
+   hot_u->sat_u.orn_h = hot_u->sat_u.orc_h = 0;
+   hot_u->sat_u.rec_t = 0;
+@@ -542,22 +544,50 @@ _uw_hot_mem(uw_hot* hot_u)
+   return hot_u->mem_v ? (c3_d)((M3MemoryHeader*)hot_u->mem_v)->length : 0;
+ }
+ 
+-//  bytes an instance holds: structs, wasm memory, and the code compiled so far
++//  bytes an instance holds: structs, wasm memory, the code compiled so far,
++//  and what is kept per function
+ static c3_d
+ _uw_hot_size(uw_hot* hot_u)
+ {
+   uw_arena* cod_u = &hot_u->sat_u.code_arena;
+   return (c3_d)hot_u->box_h
+        + _uw_hot_mem(hot_u)
+-       + ((cod_u->ini_t && cod_u->hot_t) ? (c3_d)(cod_u->nex_y - cod_u->buf_y) : 0);
++       + ((cod_u->ini_t && cod_u->hot_t) ? (c3_d)(cod_u->nex_y - cod_u->buf_y) : 0)
++       + hot_u->fun_d
++       + (c3_d)hot_u->sat_u.orc_h * sizeof(c3_h);
+ }
+ 
+ //  an empty slot to build an instance of ned_d bytes in, or NULL. now_v is
+ //  an address in the caller's frame. the least recently used instances make
+-//  way, for the slot and for the total.
++//  way, for the slot and for the total, but only if that is enough: nothing
++//  is dropped for an instance that cannot be kept anyway.
+ static uw_hot*
+ _uw_hot_take(void* now_v, c3_d ned_d)
+ {
++  c3_d bus_d = ned_d;   //  with what cannot make way: instances in use
++  c3_w bus_w = 0;
++  for (c3_w i = 0; i < UW_HOT; i++)
++  {
++    uw_hot* hot_u = &_uw_hot_u[i];
++    //  marked running, by a frame that cannot still exist: a frame that
++    //  called us would be above us on the stack. (a bail is caught and
++    //  cleans up; this is for an event aborted by a signal, which is not.)
++    //
++    if ( (2 == hot_u->sat_y) && ((c3_p)now_v >= (c3_p)hot_u->own_v) )
++    {
++      _uw_hot_free(hot_u);
++    }
++    if ( 2 == hot_u->sat_y )
++    {
++      bus_d += _uw_hot_size(hot_u);
++      bus_w++;
++    }
++  }
++  if ( (bus_d > UW_HOT_ALL) || (UW_HOT == bus_w) )
++  {
++    return NULL;
++  }
++
+   while ( 1 )
+   {
+     uw_hot* fre_u = NULL;
+@@ -566,14 +596,6 @@ _uw_hot_take(void* now_v, c3_d ned_d)
+     for (c3_w i = 0; i < UW_HOT; i++)
+     {
+       uw_hot* hot_u = &_uw_hot_u[i];
+-      //  marked running, by a frame that cannot still exist: a frame that
+-      //  called us would be above us on the stack. (a bail is caught and
+-      //  cleans up; this is for an event aborted by a signal, which is not.)
+-      //
+-      if ( (2 == hot_u->sat_y) && ((c3_p)now_v >= (c3_p)hot_u->own_v) )
+-      {
+-        _uw_hot_free(hot_u);
+-      }
+       if ( 0 == hot_u->sat_y )
+       {
+         if ( !fre_u ) fre_u = hot_u;
+@@ -2606,9 +2628,11 @@ _get_state(u3_noun hint,
+ #if UW_HOT
+     if ( hot_u )
+     {
+-      hot_u->fun_v = malloc((size_t)(wasm3_module->numFunctions + 1) * 2 * sizeof(void*));
++      hot_u->fun_d = (c3_d)(wasm3_module->numFunctions + 1) * 2 * sizeof(void*);
++      hot_u->fun_v = malloc((size_t)hot_u->fun_d);
+       if ( !hot_u->fun_v )
+       {
++        hot_u->fun_d = 0;
+         u3z(get);
+         return 2;
+       }
+@@ -2794,10 +2818,18 @@ _move_state(
+   //  suspended with lazily compiled code that outgrew the arena and is in
+   //  pieces (the caller could not make it fit): it cannot be rebuilt, so it
+   //  is not kept. the next call recomputes from the seed. nor is one kept
+-  //  inside +mice, where the uw_ord_m cache is not used (see _get_state)
++  //  inside +mice, where the uw_ord_m cache is not used (see _get_state),
++  //  nor one with more code than an ordinary load has room to rebuild: a
++  //  live instance has room for more than that
+   //
++  c3_t big_t = 0;
++#if UW_HOT
++  big_t =  sat_u->hot_v
++        && (  (c3_d)(CodeArena->nex_y - CodeArena->buf_y) + (1 << 16)
++            > (c3_d)UW_CODE_MAX );
++#endif
+   c3_t los_t =  sat_u->laz_t
+-             && (CodeArena->chk_w || sat_u->cas_t)
++             && (CodeArena->chk_w || sat_u->cas_t || big_t)
+              && sat_u->wasm_module->runtime->edge_suspend;
+ 
+   if ( (c3__oust == hint)
+-- 
+2.52.0
+
