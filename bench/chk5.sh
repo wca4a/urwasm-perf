@@ -45,10 +45,10 @@ up URWASM_FITMAX=1000 URWASM_FITLOG=1
 wl sql fitno
 echo "refused: $(n 'fit refused')   dropped for them: $(n 'UWH trim evict\|UWH open evict')"; bad
 
-echo "=== C. the ship empties its long-term cache (|meld)"
+echo "=== C. the ship empties its long-term cache (|meld, =memo &)"
 up URWASM_FITLOG=1
 wl sql wipe1
-bench/lens.sh a hood '+hood/meld' >/dev/null; sleep 20; bench/lens.sh d '(add 2 2)' >/dev/null
+bench/lens.sh a hood '+hood/meld, =memo &' >/dev/null; sleep 20; bench/lens.sh d '(add 2 2)' >/dev/null
 echo "wipe lines: $(grep -a 'UWH wipe' urbit-output | sort | uniq -c | tr '\n' ' ')"
 wl sql wipe2; bad
 
