@@ -30,3 +30,4 @@ target/
 /bench/*-work.txt
 /bench/test-out.*.txt
 .DS_Store
+*.bak
