@@ -1,0 +1,609 @@
+From a16e285924cd76d98a2a4f32ad2a53b256401818 Mon Sep 17 00:00:00 2001
+From: william arzt <bill@tlon.io>
+Date: Fri, 27 Nov 2026 15:14:53 -0500
+Subject: [PATCH] urwasm: keep-alive: interrupts on other threads, memory
+ pressure, sizing
+
+Fixes from a fifth review round.
+
+- A signal sent to the process while the event thread holds signals off
+  could be delivered to another thread (the worker has libuv's pool), whose
+  handler would then jump to u3_Signal on the event thread's stack. The
+  handlers now pass such a signal to the event thread. (Windows already
+  does the same in rsignal_longjmp.)
+- Emptying a slot forgets a mapping only after unmapping it, so that a
+  stack overflow in the middle leaves it for u3we_lia_reap() to finish.
+- When the system will not back more of a reservation, idle instances are
+  dropped and the request retried before the event fails.
+- The budget counts memory and code as far as they were made usable, not
+  as far as they are in use.
+- Nothing makes way for a new instance until it has been sized: there is
+  one spare slot to build in, and _uw_hot_fit() evicts only if that is
+  enough, before any of its memory is taken.
+- u3we_lia_wipe() drops ready instances wherever the persistent memo cache
+  is emptied.
+- The saved struct image is no longer zeroed before it is overwritten.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ pkg/noun/jets/e/urwasm.c | 237 +++++++++++++++++++++++++--------------
+ pkg/noun/jets/w.h        |   1 +
+ pkg/noun/manage.c        |  36 ++++++
+ pkg/noun/urth.c          |   2 +
+ pkg/vere/mars.c          |   2 +
+ pkg/vere/melt.c          |   2 +
+ 6 files changed, 198 insertions(+), 82 deletions(-)
+
+diff --git a/pkg/noun/jets/e/urwasm.c b/pkg/noun/jets/e/urwasm.c
+index 69303dedfd..06e51bf729 100644
+--- a/pkg/noun/jets/e/urwasm.c
++++ b/pkg/noun/jets/e/urwasm.c
+@@ -477,6 +477,10 @@ _uw_arena_free(uw_arena* ren_u)
+ //  as they fill, so only what is used is committed memory (linux charges a
+ //  writable private mapping in full against its commit limit)
+ #  define UW_HOT_STEP   ((c3_d)1 << 20)
++#  define UW_HOT_RUP(a)  (((c3_d)(a) + UW_HOT_STEP - 1) & ~(UW_HOT_STEP - 1))
++//  slots: one more than are kept, so that there is always one to build an
++//  instance in before it is known what has to make way for it
++#  define UW_HOT_NUM    (UW_HOT + 1)
+ #else
+ #  define UW_HOT        0
+ #endif
+@@ -492,7 +496,8 @@ _uw_arena_free(uw_arena* ren_u)
+ #endif
+ 
+ typedef struct {
+-  c3_y       sat_y;         //  0 free, 1 ready, 2 a call is running on it
++  c3_y       sat_y;         //  0 free, 1 ready, 2 a call is running on it,
++                            //  3 being emptied
+   c3_d       idh_d, idl_d;  //  id of the saved state this is the live form of
+   c3_d       use_d;         //  last use, for eviction
+   c3_y*      box_y;         //  struct arena (malloc)
+@@ -506,7 +511,7 @@ typedef struct {
+ } uw_hot;
+ 
+ #if UW_HOT
+-static uw_hot   _uw_hot_u[UW_HOT];
++static uw_hot   _uw_hot_u[UW_HOT_NUM];
+ static uw_hot*  _uw_hot_cur;    //  instance whose wasm memory is being served
+ static c3_d     _uw_hot_seq_d;  //  ids and use stamps
+ static c3_d     _uw_hot_non_d;  //  per process
+@@ -522,6 +527,11 @@ static sigset_t  _uw_hot_old_s;  //  signal mask before it
+ //  arrives at _uw_hot_move(). nothing in between may bail: a bail would
+ //  leave them held. holds nest.
+ //
++//  the mask is this thread's alone. a signal sent to the process while it
++//  is held may be delivered to another thread instead (the worker has
++//  libuv's pool): the handlers in manage.c pass it back to this one, where
++//  it waits like any other.
++//
+ static void
+ _uw_hot_hold(void)
+ {
+@@ -546,32 +556,48 @@ _uw_hot_move(void)
+   }
+ }
+ 
+-//  empty a slot. it is made unmatchable and forgets its buffers before they
+-//  are freed, so that nothing can find them half freed
++//  empty a slot. it is unmatchable from the first store on.
++//
++//  the hold does not stop a stack overflow, which also jumps out. so that
++//  the instances dropped after such a jump (u3we_lia_reap) can finish the
++//  job: a mapping is forgotten only once it is unmapped (unmapping it again
++//  is harmless, and these are the big ones), while a heap block is
++//  forgotten first (freeing it again is not harmless: better lost)
++//
+ static void
+ _uw_hot_free(uw_hot* hot_u)
+ {
++  void* ptr_v;
+   _uw_hot_hold();
+-  c3_y*  box_y = hot_u->box_y;
+-  c3_y*  cod_y = hot_u->cod_y;
+-  void*  mem_v = hot_u->mem_v;
+-  void** fun_v = hot_u->fun_v;
+-  c3_h*  ord_h = hot_u->sat_u.orc_h ? hot_u->sat_u.ord_h : NULL;
+-  hot_u->sat_y = 0;
++  hot_u->sat_y = 3;
+   hot_u->idh_d = hot_u->idl_d = 0;
+-  hot_u->box_y = hot_u->cod_y = NULL;
+-  hot_u->mem_v = NULL;
++  if ( hot_u->cod_y )
++  {
++    munmap(hot_u->cod_y, UW_HOT_CODE);
++    hot_u->cod_y = NULL;
++  }
++  hot_u->sat_u.code_arena.ini_t = 0;
++  hot_u->sat_u.code_arena.com_d = 0;
++  if ( hot_u->mem_v )
++  {
++    munmap(hot_u->mem_v, UW_HOT_MAP);
++    hot_u->mem_v = NULL;
++  }
+   hot_u->mec_d = 0;
++  ptr_v = hot_u->box_y;
++  hot_u->box_y = NULL;
++  hot_u->box_h = 0;
++  if ( ptr_v ) free(ptr_v);
++  ptr_v = hot_u->fun_v;
+   hot_u->fun_v = NULL;
+   hot_u->fun_d = 0;
++  if ( ptr_v ) free(ptr_v);
++  ptr_v = hot_u->sat_u.orc_h ? hot_u->sat_u.ord_h : NULL;
+   hot_u->sat_u.ord_h = NULL;
+   hot_u->sat_u.orn_h = hot_u->sat_u.orc_h = 0;
+   hot_u->sat_u.rec_t = 0;
+-  if ( box_y ) free(box_y);
+-  if ( cod_y ) munmap(cod_y, UW_HOT_CODE);
+-  if ( mem_v ) munmap(mem_v, UW_HOT_MAP);
+-  if ( fun_v ) free(fun_v);
+-  if ( ord_h ) free(ord_h);
++  if ( ptr_v ) free(ptr_v);
++  hot_u->sat_y = 0;
+   _uw_hot_move();
+ }
+ 
+@@ -580,7 +606,7 @@ static uw_hot*
+ _uw_hot_find(c3_d idh_d, c3_d idl_d)
+ {
+   if ( !idh_d ) return NULL;
+-  for (c3_w i = 0; i < UW_HOT; i++)
++  for (c3_w i = 0; i < UW_HOT_NUM; i++)
+   {
+     uw_hot* hot_u = &_uw_hot_u[i];
+     if ( (1 == hot_u->sat_y) && (hot_u->idh_d == idh_d) && (hot_u->idl_d == idl_d) )
+@@ -591,39 +617,41 @@ _uw_hot_find(c3_d idh_d, c3_d idl_d)
+   return NULL;
+ }
+ 
+-//  bytes of wasm memory an instance holds
++//  bytes of wasm memory an instance has: what a module is limited by
+ static c3_d
+ _uw_hot_mem(uw_hot* hot_u)
+ {
+   return hot_u->mem_v ? (c3_d)((M3MemoryHeader*)hot_u->mem_v)->length : 0;
+ }
+ 
+-//  bytes an instance holds: structs, wasm memory, the code compiled so far,
++//  bytes an instance holds: structs, wasm memory and code as far as they
++//  were made usable (that, not what is in use, is what the system counts),
+ //  and what is kept per function
+ static c3_d
+ _uw_hot_size(uw_hot* hot_u)
+ {
+   uw_arena* cod_u = &hot_u->sat_u.code_arena;
+   return (c3_d)hot_u->box_h
+-       + _uw_hot_mem(hot_u)
+-       + ((cod_u->ini_t && cod_u->hot_t) ? (c3_d)(cod_u->nex_y - cod_u->buf_y) : 0)
++       + hot_u->mec_d
++       + ((cod_u->ini_t && cod_u->hot_t) ? cod_u->com_d : 0)
+        + hot_u->fun_d
+        + (c3_d)hot_u->sat_u.orc_h * sizeof(c3_h);
+ }
+ 
+ //  bytes held by the instances calls are running on (they cannot make way),
+-//  and how many there are. a running instance belongs to a call further up
+-//  this stack: one a bail came out of was dropped by that call, and one an
+-//  aborted event left behind was dropped by u3we_lia_reap()
++//  and how many there are, not counting not_u. a running instance belongs
++//  to a call further up this stack: one a bail came out of was dropped by
++//  that call, and one an aborted event left behind was dropped by
++//  u3we_lia_reap()
+ static c3_d
+-_uw_hot_busy(c3_w* bus_w)
++_uw_hot_busy(uw_hot* not_u, c3_w* bus_w)
+ {
+   c3_d bus_d = 0;
+   *bus_w = 0;
+-  for (c3_w i = 0; i < UW_HOT; i++)
++  for (c3_w i = 0; i < UW_HOT_NUM; i++)
+   {
+     uw_hot* hot_u = &_uw_hot_u[i];
+-    if ( 2 == hot_u->sat_y )
++    if ( (2 == hot_u->sat_y) && (hot_u != not_u) )
+     {
+       bus_d += _uw_hot_size(hot_u);
+       (*bus_w)++;
+@@ -632,68 +660,80 @@ _uw_hot_busy(c3_w* bus_w)
+   return bus_d;
+ }
+ 
+-//  an empty slot to build an instance of ned_d bytes in, or NULL. the least
+-//  recently used instances make way, for the slot and for the total, but
+-//  only if that is enough: nothing is dropped for an instance that cannot
+-//  be kept anyway.
++//  the least recently used ready instance, if any
++static uw_hot*
++_uw_hot_old(void)
++{
++  uw_hot* old_u = NULL;
++  for (c3_w i = 0; i < UW_HOT_NUM; i++)
++  {
++    uw_hot* hot_u = &_uw_hot_u[i];
++    if ( (1 == hot_u->sat_y) && (!old_u || (hot_u->use_d < old_u->use_d)) )
++    {
++      old_u = hot_u;
++    }
++  }
++  return old_u;
++}
++
++//  an empty slot to build an instance of at least low_d bytes in, or NULL.
++//  nothing makes way for it yet: that waits until it is known what the
++//  instance takes (_uw_hot_fit)
+ static uw_hot*
+-_uw_hot_take(c3_d ned_d)
++_uw_hot_take(c3_d low_d)
+ {
+   c3_w bus_w;
+-  c3_d bus_d = ned_d + _uw_hot_busy(&bus_w);
+-  if ( (bus_d > UW_HOT_ALL) || (UW_HOT == bus_w) )
++  if (  (low_d + _uw_hot_busy(NULL, &bus_w) > UW_HOT_ALL)
++     || (bus_w >= UW_HOT) )
+   {
+     return NULL;
+   }
+-
+-  while ( 1 )
++  for (c3_w i = 0; i < UW_HOT_NUM; i++)
+   {
+-    uw_hot* fre_u = NULL;
+-    uw_hot* old_u = NULL;
+-    c3_d    all_d = ned_d;
+-    for (c3_w i = 0; i < UW_HOT; i++)
+-    {
+-      uw_hot* hot_u = &_uw_hot_u[i];
+-      if ( 0 == hot_u->sat_y )
+-      {
+-        if ( !fre_u ) fre_u = hot_u;
+-        continue;
+-      }
+-      all_d += _uw_hot_size(hot_u);
+-      if ( (1 == hot_u->sat_y) && (!old_u || (hot_u->use_d < old_u->use_d)) )
+-      {
+-        old_u = hot_u;
+-      }
+-    }
+-    if ( fre_u && (all_d <= UW_HOT_ALL) ) return fre_u;
+-    if ( !old_u ) return NULL;
+-    _uw_hot_free(old_u);
++    if ( 0 == _uw_hot_u[i].sat_y ) return &_uw_hot_u[i];
+   }
++  return NULL;
+ }
+ 
+-//  drop the least recently used ready instances until what is kept fits
++//  drop the least recently used ready instances until what is kept fits,
++//  with hot_u (if not NULL) counted as ned_d bytes
+ static void
+-_uw_hot_trim(void)
++_uw_hot_trim(uw_hot* hot_u, c3_d ned_d)
+ {
+   while ( 1 )
+   {
+-    uw_hot* old_u = NULL;
+-    c3_d    all_d = 0;
+-    for (c3_w i = 0; i < UW_HOT; i++)
++    c3_d all_d = hot_u ? ned_d : 0;
++    c3_w num_w = 0;
++    for (c3_w i = 0; i < UW_HOT_NUM; i++)
+     {
+-      uw_hot* hot_u = &_uw_hot_u[i];
+-      if ( 0 == hot_u->sat_y ) continue;
+-      all_d += _uw_hot_size(hot_u);
+-      if ( (1 == hot_u->sat_y) && (!old_u || (hot_u->use_d < old_u->use_d)) )
+-      {
+-        old_u = hot_u;
+-      }
++      uw_hot* her_u = &_uw_hot_u[i];
++      if ( 0 == her_u->sat_y ) continue;
++      num_w++;
++      if ( her_u != hot_u ) all_d += _uw_hot_size(her_u);
+     }
+-    if ( (all_d <= UW_HOT_ALL) || !old_u ) return;
++    uw_hot* old_u = _uw_hot_old();
++    if ( ((all_d <= UW_HOT_ALL) && (num_w <= UW_HOT)) || !old_u ) return;
+     _uw_hot_free(old_u);
+   }
+ }
+ 
++//  make way for hot_u, which a call is about to run on and which will hold
++//  ned_d bytes, or say that it cannot be kept. the least recently used
++//  ready instances go, but only if that is enough: nothing is dropped for
++//  an instance that cannot be kept anyway
++static c3_t
++_uw_hot_fit(uw_hot* hot_u, c3_d ned_d)
++{
++  c3_w bus_w;
++  if (  (ned_d + _uw_hot_busy(hot_u, &bus_w) > UW_HOT_ALL)
++     || (bus_w >= UW_HOT) )
++  {
++    return 0;
++  }
++  _uw_hot_trim(hot_u, ned_d);
++  return 1;
++}
++
+ //  the buffers of a new instance with a struct image of box_h bytes. each
+ //  is one fixed piece for the life of the instance, so no pointer into
+ //  them ever goes stale. on failure the slot is left empty.
+@@ -721,17 +761,20 @@ _uw_hot_room(uw_hot* hot_u, c3_h box_h)
+ }
+ 
+ //  make the first len_d bytes of a reservation of max_d bytes at bas_y
+-//  usable, of which *com_d bytes already are
++//  usable, of which *com_d bytes already are. if the system will not back
++//  them, what the idle instances hold is the first thing to give up
+ static c3_t
+ _uw_hot_open(c3_y* bas_y, c3_d* com_d, c3_d len_d, c3_d max_d)
+ {
+   if ( len_d <= *com_d ) return 1;
+   if ( len_d > max_d ) return 0;
+-  c3_d new_d = c3_min((len_d + UW_HOT_STEP - 1) & ~(UW_HOT_STEP - 1), max_d);
+-  if ( 0 != mprotect(bas_y + *com_d, (size_t)(new_d - *com_d),
+-                     PROT_READ | PROT_WRITE) )
++  c3_d new_d = c3_min(UW_HOT_RUP(len_d), max_d);
++  while ( 0 != mprotect(bas_y + *com_d, (size_t)(new_d - *com_d),
++                        PROT_READ | PROT_WRITE) )
+   {
+-    return 0;
++    uw_hot* old_u = _uw_hot_old();
++    if ( !old_u ) return 0;
++    _uw_hot_free(old_u);
+   }
+   *com_d = new_d;
+   return 1;
+@@ -788,7 +831,7 @@ u3we_lia_reap(void)
+   //
+   _uw_hot_hol_w = 0;
+   _uw_hot_cur = NULL;
+-  for (c3_w i = 0; i < UW_HOT; i++)
++  for (c3_w i = 0; i < UW_HOT_NUM; i++)
+   {
+     if ( 1 != _uw_hot_u[i].sat_y )
+     {
+@@ -798,6 +841,24 @@ u3we_lia_reap(void)
+ #endif
+ }
+ 
++//  the persistent memo cache was emptied (memory pressure, |meld), and
++//  with it every saved state a ready instance was the live form of: none
++//  of them can be asked for again, so let go of what they hold
++//
++void
++u3we_lia_wipe(void)
++{
++#if UW_HOT
++  for (c3_w i = 0; i < UW_HOT_NUM; i++)
++  {
++    if ( 1 == _uw_hot_u[i].sat_y )
++    {
++      _uw_hot_free(&_uw_hot_u[i]);
++    }
++  }
++#endif
++}
++
+ //  wasm3 calls this at the start of every function compilation.
+ //  the layout of compiled code is a function of the order of compilation
+ //  alone (nothing else allocates from the code arena), so a lazily compiled
+@@ -2677,8 +2738,16 @@ _get_state(u3_noun hint,
+       //  table, the wasm memory, and the order of compilation, with room
+       //  for every function (each is compiled at most once in an instance)
+       //
++      //  this is also where it is first known what the instance takes
++      //  (the code a suspended computation needs rebuilt included), so
++      //  here, before any of it is taken, is where the others make way
++      //
+       c3_d fun_d = (c3_d)(wasm3_module->numFunctions + 1) * 2 * sizeof(void*);
+       c3_h orc_h = laz_t ? c3_max(wasm3_module->numFunctions, 1) : 0;
++      c3_d mem_d = (c3_d)len_buf_h + sizeof(M3MemoryHeader);
++      c3_d ned_d = (c3_d)box_len_h + fun_d + (c3_d)orc_h * sizeof(c3_h)
++                 + UW_HOT_RUP(mem_d)
++                 + UW_HOT_RUP(ord_t ? (c3_d)ord_use : 1);
+       _uw_hot_hold();
+       hot_u->fun_v = malloc((size_t)fun_d);
+       hot_u->fun_d = hot_u->fun_v ? fun_d : 0;
+@@ -2690,8 +2759,8 @@ _get_state(u3_noun hint,
+       _uw_hot_move();
+       if (  !hot_u->fun_v
+          || (orc_h && !sat_u->orc_h)
+-         || !_uw_hot_open(hot_u->mem_v, &hot_u->mec_d,
+-                          (c3_d)len_buf_h + sizeof(M3MemoryHeader), UW_HOT_MAP) )
++         || !_uw_hot_fit(hot_u, ned_d)
++         || !_uw_hot_open(hot_u->mem_v, &hot_u->mec_d, mem_d, UW_HOT_MAP) )
+       {
+         u3z(get);
+         return 2;
+@@ -3151,8 +3220,12 @@ _move_state(
+   {
+     //  the image, then the id that ties this saved state to the instance
+     //
++    //  (not zeroed first: all of it is written below, but for what
++    //  pads the last word)
++    //
+     u3i_slab sab_u;
+-    u3i_slab_init(&sab_u, 3, (c3_d)box_len_h + 16);
++    u3i_slab_bare(&sab_u, 3, (c3_d)box_len_h + 16);
++    sab_u.buf_w[sab_u.len_w - 1] = 0;
+     memcpy(sab_u.buf_y, BoxArena->buf_y, box_len_h);
+     hot_u->idh_d = _uw_hot_non_d;   //  set before the instance was taken
+     hot_u->idl_d = ++_uw_hot_seq_d;
+@@ -3497,7 +3570,7 @@ u3we_lia_run_v1(u3_noun cor)
+           //  not yet marked running, where nothing would release it
+           //
+           _uw_hot_hold();
+-          got_u = _uw_hot_take((c3_d)p_box + (c3_d)p_mem);
++          got_u = _uw_hot_take((c3_d)p_box + (c3_d)p_mem);  //  at least
+           if ( got_u && !_uw_hot_room(got_u, (c3_h)p_box) )
+           {
+             got_u = NULL;   //  no room to keep it: run the ordinary way
+@@ -3826,12 +3899,12 @@ u3we_lia_run_v1(u3_noun cor)
+       {
+         c3_w bus_w;
+         if (  (_uw_hot_mem(hot_u) > UW_HOT_MEM)
+-           || (_uw_hot_size(hot_u) + _uw_hot_busy(&bus_w) > UW_HOT_ALL) )
++           || (_uw_hot_size(hot_u) + _uw_hot_busy(NULL, &bus_w) > UW_HOT_ALL) )
+         {
+           _uw_hot_free(hot_u);
+         }
+       }
+-      _uw_hot_trim();
++      _uw_hot_trim(NULL, 0);
+     }
+ #endif
+   }
+diff --git a/pkg/noun/jets/w.h b/pkg/noun/jets/w.h
+index 55ee9875ff..b4006d36d9 100644
+--- a/pkg/noun/jets/w.h
++++ b/pkg/noun/jets/w.h
+@@ -326,6 +326,7 @@
+     u3_noun u3we_lia_run_v1(u3_noun);
+     u3_noun u3we_lia_run_once(u3_noun);
+     void    u3we_lia_reap(void);
++    void    u3we_lia_wipe(void);
+ 
+     //+|  %utilities
+     u3_noun u3we_bytestream_rip_octs(u3_noun);
+diff --git a/pkg/noun/manage.c b/pkg/noun/manage.c
+index 433781258d..116d413fe4 100644
+--- a/pkg/noun/manage.c
++++ b/pkg/noun/manage.c
+@@ -5,6 +5,7 @@
+ #include <ctype.h>
+ #ifndef U3_OS_windows
+ #include <dlfcn.h>
++#include <pthread.h>
+ #endif
+ #include <errno.h>
+ #include <signal.h>
+@@ -227,9 +228,35 @@ _cm_signal_handle_over(int x)
+ }
+ #endif
+ 
++#ifndef U3_OS_windows
++//  the thread that runs events: u3_Signal is a place on its stack
++//
++static pthread_t u3_Sigted;
++
++/* _cm_signal_pass(): a signal sent to the process is delivered to any
++**                    thread that does not block it, and a jump to u3_Signal
++**                    from another thread's handler is undefined. hand it to
++**                    the event thread instead; say if that was done.
++*/
++static c3_t
++_cm_signal_pass(int sig_i)
++{
++  if ( pthread_equal(pthread_self(), u3_Sigted) ) {
++    return 0;
++  }
++  pthread_kill(u3_Sigted, sig_i);
++  return 1;
++}
++#else
++#  define _cm_signal_pass(sig_i)  (0)   //  rsignal_longjmp() sees to it
++#endif
++
+ static void
+ _cm_signal_handle_term(int x)
+ {
++  if ( _cm_signal_pass(x) ) {
++    return;
++  }
+   //  Ignore if we are using base memory from work memory, very rare.
+   //
+   if ( (0 != u3H->rod_u.kid_p) && (&(u3H->rod_u) == u3R) ) {
+@@ -243,6 +270,9 @@ _cm_signal_handle_term(int x)
+ static void
+ _cm_signal_handle_intr(int x)
+ {
++  if ( _cm_signal_pass(x) ) {
++    return;
++  }
+   //  Interrupt: stop work.  Ignore if not working, or (rarely) using base.
+   //
+   if ( &(u3H->rod_u) == u3R ) {
+@@ -256,6 +286,9 @@ _cm_signal_handle_intr(int x)
+ static void
+ _cm_signal_handle_alrm(int x)
+ {
++  if ( _cm_signal_pass(x) ) {
++    return;
++  }
+   _cm_signal_handle(c3__alrm);
+ }
+ 
+@@ -429,6 +462,9 @@ _cm_signal_deep(void)
+   u3_windows_stack_guard();
+   rsignal_install_handler(SIGSTK, _cm_signal_handle_over);
+ #endif
++#endif
++#ifndef U3_OS_windows
++  u3_Sigted = pthread_self();
+ #endif
+   rsignal_install_handler(SIGINT, _cm_signal_handle_intr);
+   rsignal_install_handler(SIGTERM, _cm_signal_handle_term);
+diff --git a/pkg/noun/urth.c b/pkg/noun/urth.c
+index 76a05cebd5..ff4f1afcb9 100644
+--- a/pkg/noun/urth.c
++++ b/pkg/noun/urth.c
+@@ -11,6 +11,7 @@
+ #include "hashtable.h"
+ #include "imprison.h"
+ #include "jets.h"
++#include "jets/w.h"
+ #include "manage.h"
+ #include "options.h"
+ #include "retrieve.h"
+@@ -559,6 +560,7 @@ u3u_melt(void)
+ 
+   u3h_free(u3R->cax.per_p);
+   u3R->cax.per_p = u3h_new_cache(u3C.per_w);
++  u3we_lia_wipe();  //  wasm instances kept for the states that were in it
+ 
+   u3h_free(u3R->cax.for_p);
+   u3R->cax.for_p = u3h_new_cache(u3C.per_w);
+diff --git a/pkg/vere/mars.c b/pkg/vere/mars.c
+index 2f1a7a498c..236badf9d9 100644
+--- a/pkg/vere/mars.c
++++ b/pkg/vere/mars.c
+@@ -5,6 +5,7 @@
+ #include "c3/c3.h"
+ #include "version.h"
+ #include "noun.h"
++#include "jets/w.h"
+ #include "events.h"
+ #include "pace.h"
+ #include "ship.h"
+@@ -813,6 +814,7 @@ _mars_post(u3_mars* mar_u)
+     }
+     u3h_free(u3R->cax.per_p);
+     u3R->cax.per_p = u3h_new_cache(u3C.per_w);
++    u3we_lia_wipe();  //  wasm instances kept for the states that were in it
+     u3h_free(u3R->cax.for_p);
+     u3R->cax.for_p = u3h_new_cache(u3C.per_w);
+     gan_w = u3m_pack();
+diff --git a/pkg/vere/melt.c b/pkg/vere/melt.c
+index 8ecf81549a..68947a0fc5 100644
+--- a/pkg/vere/melt.c
++++ b/pkg/vere/melt.c
+@@ -3,6 +3,7 @@
+ #include "events.h"
+ #include "hashtable.h"
+ #include "jets.h"
++#include "jets/w.h"
+ #include "options.h"
+ #include "retrieve.h"
+ #include "vortex.h"
+@@ -119,6 +120,7 @@ u3_melt_all(FILE *fil_u, c3_w opt_w)
+   if ( opt_w & u3_melt_memo ) {
+     u3h_free(u3R->cax.per_p);
+     u3R->cax.per_p = u3h_new_cache(u3C.per_w);
++    u3we_lia_wipe();  //  wasm instances kept for the states that were in it
+   }
+ 
+   if ( opt_w & u3_melt_ford ) {
+-- 
+2.52.0
+

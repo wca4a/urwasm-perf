@@ -487,3 +487,58 @@ Checks on `urwasm-hot-test`, run independently after the subagent's own run:
 Not tested: any Linux run (only an aarch64-linux-musl cross-compile; the commit behaviour the change is for has not been observed),
 a signal landing inside a held section, a stack overflow inside one, code-commit refusal while an instance is being built, and
 Windows (keep-alive is compiled out there; checked only by compiling with the block disabled).
+
+### Keep-alive: fifth review round, at high reasoning effort (2026-11-27)
+
+A second Codex pass at `high` over the whole branch, including the fourth round's fixes, found one P1, five P2 and one P3. All
+seven are addressed in a fourth commit on `urwasm-hot` (a16e285, `patches/0007-*`).
+
+- Signals on other threads (P1). `pthread_sigmask` holds a signal off on the calling thread only. A signal sent to the process
+  during a hold is delivered to another thread instead (the worker has libuv's pool, used for disk commits), and that thread's
+  handler would `siglongjmp` to `u3_Signal`, which is a place on the event thread's stack. `_cm_signal_deep` now records the event
+  thread, and the SIGINT, SIGTERM and SIGVTALRM handlers pass a signal that arrives anywhere else to it with `pthread_kill` and
+  return (`_cm_signal_pass`, 36 lines in `manage.c`). This is what the Windows `rsignal_longjmp` already does. The jump from
+  another thread was possible before keep-alive whenever the kernel picked a pool thread; the holds made it certain.
+- Stack overflow while emptying a slot. The hold does not stop that one. `_uw_hot_free` marks the slot (state 3), unmaps each
+  mapping and only then forgets it, and forgets each heap block before freeing it. A jump out leaves the mappings for
+  `u3we_lia_reap()` to finish; a heap block caught mid-free is lost rather than freed twice.
+- Refused commit with idle instances. `_uw_hot_open` drops ready instances, least recently used first, and retries the `mprotect`
+  before giving up. Only then does a call fall back (before it runs) or bail `%meme` (while wasm runs).
+- Budget. `_uw_hot_size` counts wasm memory and code as far as they were opened (`mec_d`, `com_d`), not as far as they are in use.
+  The per-module limit still goes by the logical length.
+- Sizing before eviction. There are now `UW_HOT + 1` slots, so one is always free to build in. `_uw_hot_take` evicts nothing.
+  `_get_state` computes what the instance takes once the image is unpacked (struct image, scratch and order tables, memory, and
+  the code a suspended computation needs rebuilt) and calls `_uw_hot_fit` before any of it is committed: the others make way only
+  if that is enough, otherwise the call loads the ordinary way.
+- Emptied memo cache. `u3we_lia_wipe()` drops ready instances at the three places the persistent cache is replaced: `_mars_post`
+  at threshold 0, `u3_melt_all` with `u3_melt_memo`, and `u3u_melt` (one line each, plus the include).
+- The saved image goes into a `u3i_slab_bare` slab with only its last word cleared (P3).
+
+Checks on `urwasm-hot-test` (`bench/chk.sh`, then `bench/sig5.sh` and `bench/chk5.sh` for the new paths):
+
+| | plain | `URWASM_BIG=1` |
+|---|---|---|
+| upstream wasm tests | 48/48, same as original | 48/48, same as original |
+| `+hot-test` | all agree, identical to keep-alive off | all agree, identical to keep-alive off |
+| rustmod sequence | matches Node | matches Node |
+| notes, 814 requests | 0 different, 913 ms | 0 different, 916 ms |
+| SQL, 367 requests | 0 different, 3353 ms | 0 different, 40127 ms |
+| poker, 905 requests | 0 different, 2033 ms | 0 different, 2068 ms |
+| bails / faults | 0 / 0 | 0 / 0 |
+
+- Signal during a hold (`sig5.sh`): the test build naps 2.5 s inside the admission hold and `kill -INT` goes to the worker 0.3 s
+  in. With the fix: 6 sent, 6 delivered to another thread, 6 passed on, each arriving after the hold ended (reap saw hold 0 and one
+  running slot), 6 `recover: dig: intr`, same worker pid, then SQL 367 with 0 different. With the handlers as they were
+  (`URWASM_NOPASS`): the first one killed the worker (`Assertion '0' failed` in `manage.c`, "pier: serf unexpectedly shut down").
+- Refused commit (`URWASM_OPENBUSY`: every open fails while a ready instance exists): notes, SQL, poker, notes, SQL in one worker,
+  all 0 different, 4 idle instances dropped, no event failed.
+- Sizing (`URWASM_FITLOG`): over the upstream tests and the three workloads 29 instances were sized and 9 were dropped by count or
+  budget. Of 19 price/held pairs, 17 were equal and 2 held 1 MiB more after a call that grew. With every fit refused
+  (`URWASM_FITMAX=1000`): 386 refusals, nothing dropped for them, SQL 0 different.
+- Wipe: `|meld, =memo &` after an SQL run released the one ready instance (worker address space down by 7.9 GiB); the next SQL run
+  was 0 different.
+- Overflow mid-free (`URWASM_FREEOVER`, a `u3m_signal(c3__over)` after the slot is marked): the reap found one half-emptied slot
+  with its mappings and left none; the next SQL run was 0 different.
+
+Not tested: any Linux run (cross-compile only), a real stack overflow inside `free()` (only the simulated jump), the `_mars_post`
+threshold-0 and `u3u_melt` call sites of the wipe (the `u3_melt_all` one was), Windows.
