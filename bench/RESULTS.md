@@ -446,3 +446,44 @@ state down the "too much code" path:
 | forced drops / bails / faults | 0 / 0 / 0 | 22 / 0 / 0 |
 
 The forced run is slow for SQL because each dropped state is recomputed from the seed; it is there to show the answers stay right.
+
+### Keep-alive: fourth review round, at high reasoning effort (2026-11-27)
+
+The first three Codex passes ran at the config default, `model_reasoning_effort = "low"` (gpt-6.2-astra). A fourth pass at `high`
+(`codex review --base urwasm-fast-clean -c 'model_reasoning_effort="high"'`) found one P1 and five P2 that the low passes had missed.
+All six are addressed in a third commit on `urwasm-hot` (5fc5ec7, `patches/0006-*`), written by Claude Opus 5.5 and checked here.
+
+- Signal aborts (P1). SIGINT, SIGTERM and SIGVTALRM longjmp out of whatever is running, straight to `u3m_soft_top`. They are now
+  blocked (`pthread_sigmask`, nestable `_uw_hot_hold`/`_uw_hot_move`) around every malloc/free/munmap of live-instance state and
+  while a slot changes hands, and `_uw_hot_free` makes a slot unmatchable and forgets its buffers before freeing them.
+- Abandoned running slots. The stack-address guess is gone. `u3m_soft_top`'s signal recovery calls a new `u3we_lia_reap()`, which
+  frees every slot that is not ready. This is the one change outside `urwasm.c` (6 lines in `manage.c`, 1 in `jets/w.h`): only the
+  recovery point knows that every running slot is abandoned.
+- Entropy. The per-process id part is made at admission; if `ent_getentropy` fails no ids are issued and calls load the ordinary way.
+- Linux commit. Both reservations are mapped `PROT_NONE` and opened with `mprotect` in 1 MiB steps as they fill. Refusal before the
+  call runs takes the ordinary path; refusal while wasm runs bails `%meme` (never a failed `memory.grow`).
+- Compile-order buffer. A live instance gets room for every function up front, with its scratch table and first memory, so failure
+  there takes the ordinary path.
+- An instance too big to keep beside the running ones is dropped before trimming the others.
+
+Checks on `urwasm-hot-test`, run independently after the subagent's own run:
+
+| | plain | `URWASM_BIG=1` |
+|---|---|---|
+| upstream wasm tests | 48/48, same as original | 48/48, same as original |
+| `+hot-test` | all agree, identical to keep-alive off | all agree, identical to keep-alive off |
+| rustmod sequence | matches Node | matches Node |
+| notes, 814 requests | 0 different, 1027 ms | 0 different, 1033 ms |
+| SQL, 367 requests | 0 different, 3816 ms | 0 different, 43868 ms |
+| poker, 905 requests | 0 different, 2231 ms | 0 different, 2209 ms |
+| bails / faults | 0 / 0 | 0 / 0 |
+
+- rustmod with a 300 MB `memory.grow` mid-run: matches Node; the instance is dropped afterwards ("drop self").
+- Interrupts: `kill -INT` to the `urbit work` process during SQL and poker runs, 8 times: 8 `recover: dig: intr`, 8 reaps, same
+  worker pid, then notes 814 / SQL 367 / poker 905 all 0 different on that worker, no bails or faults. (The subagent's own run: 29
+  aborts with SIGINT and SIGVTALRM, same outcome; forced entropy failure, order-buffer failure and pre-call commit refusal all took
+  the ordinary path with 0 different; forced mid-call commit refusal bailed `%meme` and the worker kept serving.)
+
+Not tested: any Linux run (only an aarch64-linux-musl cross-compile; the commit behaviour the change is for has not been observed),
+a signal landing inside a held section, a stack overflow inside one, code-commit refusal while an instance is being built, and
+Windows (keep-alive is compiled out there; checked only by compiling with the block disabled).
